@@ -33,6 +33,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import { randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
 import { isLoopbackHost, resolveDaemonInvocation, resolveRpcExtensionPath } from "./runtime-entry.js";
+import { resolvePiInvocation } from "./resolve-pi.js";
 
 import type {
 	ExtensionAPI,
@@ -402,22 +403,22 @@ function broadcastClients(event: string, data: unknown): void {
 // RPC to pi agent
 function createRpcProcess(): any {
 	const extensionPath = resolveRpcExtensionPath(import.meta.url);
-	const proc = spawn(
-		"pi",
-		[
-			"--mode",
-			"rpc",
-			"--extension",
-			extensionPath,
-		],
-		{
-			stdio: ["pipe", "pipe", "pipe"],
-			env: {
-				...process.env,
-				OLLAMA_HOST: process.env.OLLAMA_HOST || "localhost:11434",
-			},
+	const invocation = resolvePiInvocation([
+		"--mode",
+		"rpc",
+		"--extension",
+		extensionPath,
+	]);
+	const proc = spawn(invocation.command, invocation.args, {
+		stdio: ["pipe", "pipe", "pipe"],
+		env: {
+			...process.env,
+			OLLAMA_HOST: process.env.OLLAMA_HOST || "localhost:11434",
 		},
-	);
+	});
+	proc.on("error", (error) => {
+		logger.error("[gateway] Failed to start pi RPC process:", error);
+	});
 
 	// Give the interactive bridge a way to write to pi's stdin
 	setStdinWriter((line: string) => {

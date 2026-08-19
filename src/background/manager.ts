@@ -16,6 +16,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { createBackgroundSession } from "../sessions/store.js";
 import { randomBytes } from "node:crypto";
 import { logger } from "../logger.js";
+import { resolvePiInvocation } from "../resolve-pi.js";
 
 export type BackgroundStatus =
 	| "running"
@@ -154,9 +155,14 @@ export function startBackgroundTask(
 	}
 
 	// Start the actual process
-	const proc = spawn("pi", ["--mode", "json", "--print", command], {
+	const invocation = resolvePiInvocation(["--mode", "json", "--print", command]);
+	const proc = spawn(invocation.command, invocation.args, {
 		stdio: ["pipe", "pipe", "pipe"],
 		env: { ...process.env },
+	});
+	proc.on("error", (error) => {
+		logger.error("[BackgroundTasks] Failed to start pi:", error);
+		failTask(id, error instanceof Error ? error.message : String(error));
 	});
 
 	runningProcesses.set(id, proc);
