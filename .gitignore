@@ -1,8 +1,6 @@
 node_modules/
-dist/*
+dist/
 package-lock.json
 *.log
 
-# Keep compiled extension entrypoints (git install has no build step)
-!dist/*.js
-!**/dist/*.js
+
