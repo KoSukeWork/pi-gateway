@@ -2,18 +2,18 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 /**
  * Events that can fire before a deferred runtime finishes registering.
- * A no-op waiter is installed for each so `for-of` over the live handler list
- * will also run the runtime handler pushed during `await ready`.
+ * session_start / resources_discover are recorded and replayed; they must
+ * not await the heavy graph or bindExtensions stays blocked for seconds.
  */
-const EARLY_EVENTS = [
-	"session_start",
+const REPLAY_EVENTS = ["session_start", "resources_discover"] as const;
+
+const BLOCKING_EVENTS = [
 	"session_shutdown",
 	"session_before_switch",
 	"session_before_fork",
 	"session_before_compact",
 	"session_compact",
 	"session_tree",
-	"resources_discover",
 	"before_agent_start",
 	"before_provider_request",
 	"before_provider_headers",
@@ -33,32 +33,48 @@ const EARLY_EVENTS = [
 ] as const;
 
 type ExtensionFactory = (pi: ExtensionAPI) => unknown;
-type Starter = () => Promise<unknown>;
 
-const QUEUE_KEY = Symbol.for("pi-certification.lazy-extension.queue");
-
-function getQueue(): Starter[] {
-	const g = globalThis as Record<symbol, Starter[] | undefined>;
-	g[QUEUE_KEY] ??= [];
-	return g[QUEUE_KEY];
-}
-
-function startAll(): Promise<unknown[]> {
-	return Promise.allSettled(getQueue().map((start) => start()));
+function wrapForReplay(
+	pi: ExtensionAPI,
+	pending: Map<string, { event: unknown; ctx: unknown }>,
+): ExtensionAPI {
+	const origOn = pi.on.bind(pi);
+	return new Proxy(pi, {
+		get(target, prop, receiver) {
+			if (prop === "on") {
+				return (event: string, handler: (event: unknown, ctx: unknown) => unknown) => {
+					origOn(event as never, handler as never);
+					const saved = pending.get(event);
+					if (!saved) return;
+					try {
+						void handler(saved.event, saved.ctx);
+					} catch (error) {
+						const message = error instanceof Error ? error.stack ?? error.message : String(error);
+						console.error(`[pi-lazy-extension] replay ${event} failed: ${message}`);
+					}
+				};
+			}
+			const value = Reflect.get(target, prop, receiver);
+			return typeof value === "function" ? value.bind(target) : value;
+		},
+	});
 }
 
 export function installDeferred(
 	pi: ExtensionAPI,
 	load: () => Promise<{ default: ExtensionFactory }>,
 ): void {
+	const pending = new Map<string, { event: unknown; ctx: unknown }>();
+	const runtimePi = wrapForReplay(pi, pending);
 	let ready: Promise<unknown> | undefined;
+
 	const ensure = () => {
 		if (!ready) {
 			ready = load().then((mod) => {
 				if (typeof mod.default !== "function") {
 					throw new Error("Extension runtime does not export a factory");
 				}
-				return mod.default(pi);
+				return mod.default(runtimePi);
 			});
 			void ready.catch((error) => {
 				const message = error instanceof Error ? error.stack ?? error.message : String(error);
@@ -68,17 +84,25 @@ export function installDeferred(
 		return ready;
 	};
 
-	getQueue().push(ensure);
+	const on = pi.on as (event: string, handler: (event: unknown, ctx: unknown) => unknown) => void;
 
-	// Do not compile during factory(). Pi loads extensions sequentially and
-	// resourceLoader.reload() awaits after factories — an in-flight jiti
-	// compile would still block createAgentSessionRuntime. Kick every queued
-	// runtime on the first real event so they compile together instead of
-	// one-plugin-at-a-time.
-	const on = pi.on as (event: string, handler: () => Promise<void>) => void;
-	for (const event of EARLY_EVENTS) {
+	for (const event of REPLAY_EVENTS) {
+		on(event, (e, ctx) => {
+			pending.set(event, { event: e, ctx });
+			if (event === "session_start") {
+				// After bindExtensions / RPC ready. Immediate import() steals the
+				// event loop and puts the 10s compile back on the ready path.
+				setTimeout(() => {
+					void ensure();
+				}, 250);
+			}
+		});
+	}
+
+	for (const event of BLOCKING_EVENTS) {
 		on(event, async () => {
-			await startAll();
+			if (event === "session_shutdown" && !ready) return;
+			await ensure();
 		});
 	}
 }
