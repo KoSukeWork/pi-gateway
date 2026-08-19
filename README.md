@@ -289,6 +289,8 @@ Then talk normally. That chat is bound to the desktop session file via RPC `swit
 
 If the session file was written in the last 15 seconds, `/continue` warns that the desktop Pi may still be live.
 
+On Discord these are also registered as **slash commands** (`/continue`, `/session`, `/detach`, `/model`, `/restart`). Global commands can take a few minutes to appear; DMs work after the bot shares a server with you. Re-invite the bot with the `applications.commands` scope if `/` shows nothing.
+
 ## Commands
 
 | Command | Description |

@@ -11,6 +11,7 @@
 
 import { BaseAdapter, type PlatformMessage, type PlatformConfig } from "./base.js";
 import { logger } from "../logger.js";
+import { DISCORD_SLASH_COMMANDS, slashInteractionToContent } from "./slash-commands.js";
 
 export interface DiscordConfig extends PlatformConfig {
   platform: "discord";
@@ -29,6 +30,8 @@ export class DiscordAdapter extends BaseAdapter {
   private heartbeatInterval: ReturnType<typeof setInterval> | null = null;
   private sequence: number | null = null;
   private sessionId: string | null = null;
+  private botUserId: string | null = null;
+  private applicationId: string | null = null;
   private intents: number = 0;
 
   constructor(config: DiscordConfig) {
@@ -138,11 +141,18 @@ export class DiscordAdapter extends BaseAdapter {
     switch (type) {
       case "READY":
         this.sessionId = data.session_id;
+        this.botUserId = data.user?.id ?? null;
+        this.applicationId = data.application?.id ?? data.user?.id ?? null;
         logger.info(`[Discord] Logged in as ${data.user.username}`);
+        await this.registerDefaultSlashCommands();
         break;
 
       case "MESSAGE_CREATE":
         await this.handleMessage(data);
+        break;
+
+      case "INTERACTION_CREATE":
+        await this.handleInteraction(data);
         break;
 
       case "MESSAGE_UPDATE":
@@ -186,8 +196,48 @@ export class DiscordAdapter extends BaseAdapter {
   }
 
   private getBotId(): string {
-    // Extract from token - this is approximate
-    return this.config.botToken.split(".")[0];
+    if (this.botUserId) return this.botUserId;
+    try {
+      return Buffer.from(this.config.botToken.split(".")[0], "base64").toString("utf8");
+    } catch {
+      return this.config.botToken.split(".")[0];
+    }
+  }
+
+  private async handleInteraction(data: any): Promise<void> {
+    if (data.type !== 2) return;
+    const content = slashInteractionToContent(data.data ?? {});
+    if (!content) return;
+
+    const userId = data.member?.user?.id ?? data.user?.id;
+    const channelId = data.channel_id;
+    if (!userId || !channelId) return;
+
+    try {
+      await this.apiRequest(`/interactions/${data.id}/${data.token}/callback`, {
+        method: "POST",
+        body: JSON.stringify({ type: 5 }),
+      });
+    } catch (error) {
+      logger.error("[Discord] Failed to acknowledge slash command:", error);
+      return;
+    }
+
+    const message: PlatformMessage = {
+      id: data.id,
+      platform: this.platform,
+      channelId,
+      userId,
+      content,
+      timestamp: Date.now(),
+      metadata: {
+        guildId: data.guild_id,
+        username: data.member?.user?.username ?? data.user?.username,
+        isDM: !data.guild_id,
+        slashCommand: true,
+      },
+    };
+    await this.callbacks?.onMessage(message);
   }
 
   async sendMessage(channelId: string, content: string): Promise<string> {
@@ -250,21 +300,48 @@ export class DiscordAdapter extends BaseAdapter {
   }
 
   // Helper to register slash commands
+  async registerDefaultSlashCommands(): Promise<void> {
+    const applicationId = this.applicationId ?? this.getBotId();
+    const commands = DISCORD_SLASH_COMMANDS;
+    const response = await this.apiRequest(`/applications/${applicationId}/commands`, {
+      method: "PUT",
+      body: JSON.stringify(commands),
+    });
+    if (!response.ok) {
+      const detail = await response.text();
+      logger.error(`[Discord] Global slash command registration failed: ${response.status} ${detail}`);
+      return;
+    }
+    if (this.config.guildId) {
+      const guildResponse = await this.apiRequest(
+        `/applications/${applicationId}/guilds/${this.config.guildId}/commands`,
+        {
+          method: "PUT",
+          body: JSON.stringify(commands),
+        },
+      );
+      if (!guildResponse.ok) {
+        logger.warn(
+          `[Discord] Guild slash command registration failed: ${guildResponse.status}`,
+        );
+      }
+    }
+    logger.info(`[Discord] Registered ${commands.length} slash commands`);
+  }
+
   async registerSlashCommands(commands: Array<{
     name: string;
     description: string;
     options?: any[];
   }>): Promise<void> {
-    if (!this.config.guildId) {
-      logger.warn("[Discord] guildId required for slash commands");
-      return;
-    }
-
-    await this.apiRequest(`/applications/${this.getBotId()}/guilds/${this.config.guildId}/commands`, {
+    const applicationId = this.applicationId ?? this.getBotId();
+    const path = this.config.guildId
+      ? `/applications/${applicationId}/guilds/${this.config.guildId}/commands`
+      : `/applications/${applicationId}/commands`;
+    await this.apiRequest(path, {
       method: "PUT",
       body: JSON.stringify(commands),
     });
-    
     logger.info(`[Discord] Registered ${commands.length} slash commands`);
   }
 }
