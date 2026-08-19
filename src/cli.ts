@@ -124,7 +124,7 @@ switch (cmd) {
 		const startedHealth = await waitForGatewayHealth(
 			loadHealthConfig(),
 			child.pid,
-			5000,
+			15000,
 		);
 		if (!startedHealth) {
 			console.error(

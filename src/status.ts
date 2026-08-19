@@ -252,6 +252,27 @@ export function buildGatewayHealthUrl(host: string, port: number): string {
 	return `http://${urlHost}:${port}/api/status`;
 }
 
+/** Windows often binds `localhost` to IPv6 only; probe all loopback forms. */
+export function gatewayHealthProbeUrls(host: string, port: number): string[] {
+	const urls = [buildGatewayHealthUrl(host, port)];
+	const normalized = host.trim().toLowerCase();
+	if (
+		normalized === "localhost" ||
+		normalized === "127.0.0.1" ||
+		normalized === "::1" ||
+		normalized === "[::1]"
+	) {
+		for (const candidate of [
+			`http://127.0.0.1:${port}/api/status`,
+			`http://localhost:${port}/api/status`,
+			`http://[::1]:${port}/api/status`,
+		]) {
+			if (!urls.includes(candidate)) urls.push(candidate);
+		}
+	}
+	return urls;
+}
+
 export async function waitForGatewayHealth(
 	config: GatewayHealthConfig,
 	expectedPid: number,
@@ -273,17 +294,22 @@ export async function fetchGatewayHealth(
 	fetchStatus: typeof fetch = fetch,
 ): Promise<GatewayHealth | null> {
 	try {
-		const response = await fetchStatus(
-			buildGatewayHealthUrl(config.host, config.port),
-			{
-				headers:
-					config.tokens.length > 0
-						? { Authorization: `Bearer ${config.tokens[0]}` }
-						: undefined,
-				signal: AbortSignal.timeout(1000),
-			},
-		);
-		if (!response.ok) return null;
+		let response: Response | null = null;
+		for (const url of gatewayHealthProbeUrls(config.host, config.port)) {
+			try {
+				response = await fetchStatus(url, {
+					headers:
+						config.tokens.length > 0
+							? { Authorization: `Bearer ${config.tokens[0]}` }
+							: undefined,
+					signal: AbortSignal.timeout(1000),
+				});
+				if (response.ok) break;
+			} catch {
+				response = null;
+			}
+		}
+		if (!response?.ok) return null;
 
 		const health = (await response.json()) as Partial<GatewayHealth>;
 		if (
