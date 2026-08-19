@@ -1,6 +1,8 @@
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { GATEWAY_CONFIG_DIR } from "./paths.js";
 
 export interface PiInvocation {
 	command: string;
@@ -56,6 +58,59 @@ function resolvedWindowsPiInvocation(
 	}
 
 	return undefined;
+}
+
+function agentDir(): string {
+	const configured = process.env.PI_CODING_AGENT_DIR?.trim();
+	if (configured) return configured;
+	return join(homedir(), ".pi", "agent");
+}
+
+function installedPackagePath(source: string): string | null {
+	const git = source.match(/^git:(?:https?:\/\/)?(.+?)(?:\.git)?$/i);
+	if (git) {
+		const repo = git[1].replace(/^github\.com\//i, "github.com/");
+		const path = join(agentDir(), "git", ...repo.split("/").filter(Boolean));
+		return existsSync(path) ? path : null;
+	}
+	const npm = source.match(/^npm:(.+)$/i);
+	if (npm) {
+		const path = join(agentDir(), "npm", "node_modules", npm[1]);
+		return existsSync(path) ? path : null;
+	}
+	return null;
+}
+
+function settingsPackageSources(): string[] {
+	try {
+		const settings = JSON.parse(readFileSync(join(agentDir(), "settings.json"), "utf-8"));
+		const packages = settings?.packages;
+		if (!Array.isArray(packages)) return [];
+		return packages
+			.map((entry) => (typeof entry === "string" ? entry : entry?.source))
+			.filter((source): source is string => typeof source === "string");
+	} catch {
+		return [];
+	}
+}
+
+/** Args for the gateway RPC child: isolated session dir, no nested gateway. */
+export function buildRpcPiArgs(rpcExtensionPath: string): string[] {
+	const args = [
+		"--mode",
+		"rpc",
+		"--no-extensions",
+		"--session-dir",
+		join(GATEWAY_CONFIG_DIR, "rpc-sessions"),
+		"--extension",
+		rpcExtensionPath,
+	];
+	for (const source of settingsPackageSources()) {
+		if (/pi-gateway/i.test(source)) continue;
+		const path = installedPackagePath(source);
+		if (path) args.push("--extension", path);
+	}
+	return args;
 }
 
 export function resolvePiInvocation(

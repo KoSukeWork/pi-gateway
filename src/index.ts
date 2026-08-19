@@ -33,7 +33,7 @@ import { WebSocketServer, WebSocket } from "ws";
 import { randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
 import { isLoopbackHost, resolveDaemonInvocation, resolveRpcExtensionPath } from "./runtime-entry.js";
-import { resolvePiInvocation } from "./resolve-pi.js";
+import { buildRpcPiArgs, resolvePiInvocation } from "./resolve-pi.js";
 
 import type {
 	ExtensionAPI,
@@ -403,12 +403,10 @@ function broadcastClients(event: string, data: unknown): void {
 // RPC to pi agent
 function createRpcProcess(): any {
 	const extensionPath = resolveRpcExtensionPath(import.meta.url);
-	const invocation = resolvePiInvocation([
-		"--mode",
-		"rpc",
-		"--extension",
-		extensionPath,
-	]);
+	const invocation = resolvePiInvocation(buildRpcPiArgs(extensionPath));
+	logger.info(
+		`[gateway] Starting pi RPC: ${invocation.command} ${invocation.args.join(" ")}`,
+	);
 	const proc = spawn(invocation.command, invocation.args, {
 		stdio: ["pipe", "pipe", "pipe"],
 		env: {
@@ -511,7 +509,7 @@ function createRpcProcess(): any {
 	});
 
 	proc.on("exit", (code: number) => {
-		logger.info("[gateway] pi process exited");
+		logger.info(`[gateway] pi process exited with code ${code}`);
 		// Flush any remaining line in the buffer (could be a large agent_end)
 		if (lineBuffer.trim()) {
 			try {
