@@ -1512,7 +1512,28 @@ async function updateStatus(): Promise<void> {
 		return;
 	}
 	lastGatewayStatusText = statusText;
-	ctx.ui.setStatus("gateway", statusText);
+	try {
+		ctx.ui.setStatus("gateway", statusText);
+	} catch (error) {
+		if (!isStaleExtensionCtx(error)) throw error;
+		if (statusRefreshInterval) {
+			clearInterval(statusRefreshInterval);
+			statusRefreshInterval = null;
+		}
+		globalCtx = null;
+	}
+}
+
+function isStaleExtensionCtx(error: unknown): boolean {
+	return error instanceof Error && /stale after session replacement/i.test(error.message);
+}
+
+function runOnLiveUi(fn: () => void): void {
+	try {
+		fn();
+	} catch (error) {
+		if (!isStaleExtensionCtx(error)) throw error;
+	}
 }
 
 function readDetachedHealthConfig(): GatewayConfig {
@@ -1781,10 +1802,9 @@ export default function (pi: ExtensionAPI) {
 					ctx.ui.setWidget("gateway-status", lines, {
 						placement: "belowEditor",
 					});
-					setTimeout(
-						() => ctx.ui.setWidget("gateway-status", undefined),
-						15000,
-					);
+					setTimeout(() => {
+						runOnLiveUi(() => ctx.ui.setWidget("gateway-status", undefined));
+					}, 15000);
 					return;
 				}
 
