@@ -266,6 +266,29 @@ When `requirePairing` is enabled and a user is not in the allowlist:
 2. Admin approves with `/gateway pair <code>`
 3. User is added to the DB allowlist
 
+## Continue a desktop Pi session from chat
+
+The gateway still cannot share the live TUI process. It *can* reopen the same session file after you leave the desktop window.
+
+1. Keep this package loaded in the desktop Pi so it can publish `~/.pi/gateway/active-session.json`.
+2. Start the gateway (`/gateway start` or `-d`).
+3. **Close or leave the desktop session idle** so two processes do not write the same `.jsonl`.
+4. In Telegram/Discord (admin only), send:
+
+```text
+/continue
+```
+
+Then talk normally. That chat is bound to the desktop session file via RPC `switch_session`.
+
+| Chat command | Who | Effect |
+|---|---|---|
+| `/continue` | admin | Attach this chat to the last desktop Pi session |
+| `/session` | allowed users | Show the attached file and last desktop pointer |
+| `/detach` | allowed users | Go back to an isolated gateway session |
+
+If the session file was written in the last 15 seconds, `/continue` warns that the desktop Pi may still be live.
+
 ## Commands
 
 | Command | Description |

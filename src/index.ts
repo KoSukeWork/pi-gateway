@@ -47,6 +47,14 @@ import {
 	touchSession,
 	type SessionConfig,
 } from "./sessions/store.js";
+import {
+	clearChannelBinding,
+	getChannelBinding,
+	publishActiveSession,
+	readActiveSession,
+	sessionFileAgeMs,
+	setChannelBinding,
+} from "./sessions/active-session.js";
 import { logger } from "./logger.js";
 import {
 	GATEWAY_CONFIG_DIR,
@@ -208,6 +216,7 @@ let state: GatewayState;
 let server: ReturnType<typeof createServer> | null = null;
 let wss: WebSocketServer | null = null;
 let rpcProcess: ReturnType<typeof spawn> | null = null;
+let rpcBoundSessionFile: string | null = null;
 let globalCtx: ExtensionContext | null = null;
 let cronInterval: ReturnType<typeof setInterval> | null = null;
 let statusRefreshInterval: ReturnType<typeof setInterval> | null = null;
@@ -531,10 +540,35 @@ function createRpcProcess(): any {
 		cleanupPendingUiRequests();
 		setActiveChannel(null);
 		rpcProcess = null;
+		rpcBoundSessionFile = null;
 		broadcastClients("agent_disconnected", { code });
 	});
 
 	return proc;
+}
+
+async function switchRpcSession(sessionFile: string): Promise<void> {
+	if (!existsSync(sessionFile)) {
+		throw new Error(`Session file not found: ${sessionFile}`);
+	}
+	if (rpcBoundSessionFile === sessionFile) return;
+	const result = (await sendRpc("switch_session", { sessionPath: sessionFile })) as {
+		success?: boolean;
+		data?: { cancelled?: boolean };
+		error?: string;
+	};
+	if (!result.success) {
+		throw new Error(result.error || "switch_session failed");
+	}
+	if (result.data?.cancelled) {
+		throw new Error("switch_session was cancelled by an extension");
+	}
+	rpcBoundSessionFile = sessionFile;
+}
+
+async function resetRpcSession(): Promise<void> {
+	await sendRpc("new_session");
+	rpcBoundSessionFile = null;
 }
 
 async function sendRpc(
@@ -662,6 +696,105 @@ const adapterCallbacks: AdapterCallbacks = {
 
 		// Store session reference
 		state.sessions.set(`${message.platform}:${message.channelId}`, session);
+
+		const sessionCmd = message.content.trim();
+		if (/^\/(continue|session|detach)$/i.test(sessionCmd)) {
+			const adapter = state.adapters.get(message.platform);
+			if (!rpcProcess) {
+				if (adapter) await adapter.sendMessage(message.channelId, "Agent not running.");
+				return;
+			}
+			const cmd = sessionCmd.slice(1).toLowerCase();
+			if (cmd === "session") {
+				const active = readActiveSession();
+				const bound = getChannelBinding(message.platform, message.channelId);
+				const lines = [
+					bound
+						? `This chat is attached to:\n${bound.sessionFile}`
+						: "This chat is using an isolated gateway session.",
+					active
+						? `Last desktop Pi session:\n${active.sessionFile}`
+						: "No desktop Pi session has been published yet.",
+				];
+				if (adapter) await adapter.sendMessage(message.channelId, lines.join("\n\n"));
+				return;
+			}
+			if (cmd === "detach") {
+				clearChannelBinding(message.platform, message.channelId);
+				try {
+					await resetRpcSession();
+				} catch (error) {
+					logger.error("[gateway] Failed to detach session:", error);
+				}
+				if (adapter) {
+					await adapter.sendMessage(
+						message.channelId,
+						"Detached. This chat is back on an isolated gateway session.",
+					);
+				}
+				return;
+			}
+			if (!isAdmin(message.platform as Platform, message.userId)) {
+				if (adapter) {
+					await adapter.sendMessage(
+						message.channelId,
+						"Only admins can attach this chat to the desktop Pi session.",
+					);
+				}
+				return;
+			}
+			const active = readActiveSession();
+			if (!active) {
+				if (adapter) {
+					await adapter.sendMessage(
+						message.channelId,
+						"No desktop session found. Open Pi on the machine first so the gateway can publish it.",
+					);
+				}
+				return;
+			}
+			try {
+				await switchRpcSession(active.sessionFile);
+				setChannelBinding(message.platform, message.channelId, active.sessionFile);
+				const age = sessionFileAgeMs(active.sessionFile);
+				const hot =
+					age !== null && age < 15_000
+						? "\n\nWarning: that session file was written in the last 15s. Close the desktop Pi window first or the two sides may race."
+						: "";
+				if (adapter) {
+					await adapter.sendMessage(
+						message.channelId,
+						`Attached to desktop session${active.sessionId ? ` ${active.sessionId}` : ""}.\n${active.sessionFile}${hot}`,
+					);
+				}
+			} catch (error) {
+				logger.error("[gateway] Failed to continue session:", error);
+				if (adapter) {
+					await adapter.sendMessage(
+						message.channelId,
+						`Failed to attach: ${error instanceof Error ? error.message : String(error)}`,
+					);
+				}
+			}
+			return;
+		}
+
+		const boundSession = getChannelBinding(message.platform, message.channelId);
+		if (boundSession && rpcProcess) {
+			try {
+				await switchRpcSession(boundSession.sessionFile);
+			} catch (error) {
+				logger.error("[gateway] Bound session switch failed:", error);
+				const adapter = state.adapters.get(message.platform);
+				if (adapter) {
+					await adapter.sendMessage(
+						message.channelId,
+						`Could not reopen the attached session: ${error instanceof Error ? error.message : String(error)}`,
+					);
+				}
+				return;
+			}
+		}
 
 		// ── Admin/allowed model commands ──
 		const modelMatch = message.content.match(/^\/model(?:\s+(.+))?/i);
@@ -2327,6 +2460,14 @@ export default function (pi: ExtensionAPI) {
 
 	// Keep the footer synchronized with detached daemons started outside this session.
 	pi.on("session_start", async (_event, ctx) => {
+		const sessionFile = ctx.sessionManager?.getSessionFile?.();
+		if (sessionFile) {
+			publishActiveSession({
+				sessionFile,
+				sessionId: ctx.sessionManager.getSessionId?.(),
+				cwd: ctx.cwd ?? ctx.sessionManager.getCwd?.(),
+			});
+		}
 		if (statusRefreshInterval) clearInterval(statusRefreshInterval);
 		statusRefreshInterval = null;
 		globalCtx = ctx;
