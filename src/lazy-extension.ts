@@ -1,10 +1,5 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-/**
- * Events that can fire before a deferred runtime finishes registering.
- * session_start / resources_discover are recorded and replayed; they must
- * not await the heavy graph or bindExtensions stays blocked for seconds.
- */
 const REPLAY_EVENTS = ["session_start", "resources_discover"] as const;
 
 const BLOCKING_EVENTS = [
@@ -33,12 +28,26 @@ const BLOCKING_EVENTS = [
 ] as const;
 
 type ExtensionFactory = (pi: ExtensionAPI) => unknown;
+type CommandHandler = (args: string, ctx: unknown) => unknown;
 
-function wrapForReplay(
+export type DeferredCommand = { name: string; description: string };
+
+function tryRefreshAutocomplete(pi: ExtensionAPI): void {
+	try {
+		const ui = (pi as { ui?: { addAutocompleteProvider?: (factory: (provider: unknown) => unknown) => void } }).ui;
+		ui?.addAutocompleteProvider?.((provider) => provider);
+	} catch {
+		// UI is not bound yet, or this is RPC.
+	}
+}
+
+function wrapRuntimePi(
 	pi: ExtensionAPI,
 	pending: Map<string, { event: unknown; ctx: unknown }>,
+	realCommands: Map<string, CommandHandler>,
 ): ExtensionAPI {
 	const origOn = pi.on.bind(pi);
+	const origRegisterCommand = pi.registerCommand.bind(pi);
 	return new Proxy(pi, {
 		get(target, prop, receiver) {
 			if (prop === "on") {
@@ -54,6 +63,12 @@ function wrapForReplay(
 					}
 				};
 			}
+			if (prop === "registerCommand") {
+				return (name: string, options: { handler: CommandHandler; description?: string; getArgumentCompletions?: unknown }) => {
+					realCommands.set(name, options.handler);
+					return origRegisterCommand(name, options as never);
+				};
+			}
 			const value = Reflect.get(target, prop, receiver);
 			return typeof value === "function" ? value.bind(target) : value;
 		},
@@ -63,19 +78,26 @@ function wrapForReplay(
 export function installDeferred(
 	pi: ExtensionAPI,
 	load: () => Promise<{ default: ExtensionFactory }>,
+	options: { commands?: DeferredCommand[] } = {},
 ): void {
 	const pending = new Map<string, { event: unknown; ctx: unknown }>();
-	const runtimePi = wrapForReplay(pi, pending);
+	const realCommands = new Map<string, CommandHandler>();
+	const runtimePi = wrapRuntimePi(pi, pending, realCommands);
 	let ready: Promise<unknown> | undefined;
 
 	const ensure = () => {
 		if (!ready) {
-			ready = load().then((mod) => {
-				if (typeof mod.default !== "function") {
-					throw new Error("Extension runtime does not export a factory");
-				}
-				return mod.default(runtimePi);
-			});
+			ready = load()
+				.then((mod) => {
+					if (typeof mod.default !== "function") {
+						throw new Error("Extension runtime does not export a factory");
+					}
+					return mod.default(runtimePi);
+				})
+				.then((result) => {
+					tryRefreshAutocomplete(pi);
+					return result;
+				});
 			void ready.catch((error) => {
 				const message = error instanceof Error ? error.stack ?? error.message : String(error);
 				console.error(`[pi-lazy-extension] deferred install failed: ${message}`);
@@ -84,14 +106,26 @@ export function installDeferred(
 		return ready;
 	};
 
+	for (const command of options.commands ?? []) {
+		pi.registerCommand(command.name, {
+			description: command.description,
+			handler: async (args, ctx) => {
+				await ensure();
+				const handler = realCommands.get(command.name);
+				if (!handler) {
+					throw new Error(`/${command.name} failed to load`);
+				}
+				return handler(args, ctx);
+			},
+		});
+	}
+
 	const on = pi.on as (event: string, handler: (event: unknown, ctx: unknown) => unknown) => void;
 
 	for (const event of REPLAY_EVENTS) {
 		on(event, (e, ctx) => {
 			pending.set(event, { event: e, ctx });
 			if (event === "session_start") {
-				// After bindExtensions / RPC ready. Immediate import() steals the
-				// event loop and puts the 10s compile back on the ready path.
 				setTimeout(() => {
 					void ensure();
 				}, 250);
