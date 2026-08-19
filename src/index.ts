@@ -70,6 +70,7 @@ import {
 	removeGatewayPidFile,
 	resolveGatewayStatus,
 	waitForGatewayHealth,
+	waitForSpawnedDaemonHealth,
 	writeGatewayPidFile,
 } from "./status.js";
 import {
@@ -1637,9 +1638,10 @@ export default function (pi: ExtensionAPI) {
 							return;
 						}
 
-						const startedHealth = await waitForGatewayHealth(
+						const startedHealth = await waitForSpawnedDaemonHealth(
 							readDetachedHealthConfig(),
 							child.pid,
+							readDaemonPid,
 							15000,
 						);
 						if (!startedHealth) {

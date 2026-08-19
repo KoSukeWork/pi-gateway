@@ -288,6 +288,28 @@ export async function waitForGatewayHealth(
 	return null;
 }
 
+/** Spawn PID can differ from the daemon's process.pid when tsx/node wraps the entry. */
+export async function waitForSpawnedDaemonHealth(
+	config: GatewayHealthConfig,
+	spawnPid: number,
+	readPublishedPid: () => number | null,
+	timeoutMs = 15000,
+	pollIntervalMs = 100,
+): Promise<GatewayHealth | null> {
+	const deadline = Date.now() + timeoutMs;
+	do {
+		const pids = new Set<number>([spawnPid]);
+		const published = readPublishedPid();
+		if (published !== null) pids.add(published);
+		for (const pid of pids) {
+			const health = await fetchGatewayHealth(config, pid);
+			if (health) return health;
+		}
+		await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+	} while (Date.now() < deadline);
+	return null;
+}
+
 export async function fetchGatewayHealth(
 	config: GatewayHealthConfig,
 	expectedPid: number,

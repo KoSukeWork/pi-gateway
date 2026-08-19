@@ -18,6 +18,7 @@ import {
 	parseGatewayPid,
 	removeGatewayPidFile,
 	waitForGatewayHealth,
+	waitForSpawnedDaemonHealth,
 	type GatewayHealthConfig,
 } from "./status.js";
 import { resolveDaemonInvocation } from "./runtime-entry.js";
@@ -121,9 +122,16 @@ switch (cmd) {
 			process.exit(1);
 		}
 
-		const startedHealth = await waitForGatewayHealth(
+		const startedHealth = await waitForSpawnedDaemonHealth(
 			loadHealthConfig(),
 			child.pid,
+			() => {
+				try {
+					return parseGatewayPid(readFileSync(PID_FILE, "utf-8").trim());
+				} catch {
+					return null;
+				}
+			},
 			15000,
 		);
 		if (!startedHealth) {
