@@ -698,7 +698,7 @@ const adapterCallbacks: AdapterCallbacks = {
 		state.sessions.set(`${message.platform}:${message.channelId}`, session);
 
 		const sessionCmd = message.content.trim();
-		if (/^\/(continue|session|detach)$/i.test(sessionCmd)) {
+		if (/^\/(continue|session|detach|new)$/i.test(sessionCmd)) {
 			const adapter = state.adapters.get(message.platform);
 			if (!rpcProcess) {
 				if (adapter) await adapter.sendMessage(message.channelId, "Agent not running.");
@@ -719,17 +719,19 @@ const adapterCallbacks: AdapterCallbacks = {
 				if (adapter) await adapter.sendMessage(message.channelId, lines.join("\n\n"));
 				return;
 			}
-			if (cmd === "detach") {
+			if (cmd === "detach" || cmd === "new") {
 				clearChannelBinding(message.platform, message.channelId);
 				try {
 					await resetRpcSession();
 				} catch (error) {
-					logger.error("[gateway] Failed to detach session:", error);
+					logger.error("[gateway] Failed to start a new session:", error);
 				}
 				if (adapter) {
 					await adapter.sendMessage(
 						message.channelId,
-						"Detached. This chat is back on an isolated gateway session.",
+						cmd === "new"
+							? "Started a new isolated conversation."
+							: "Detached. This chat is back on an isolated gateway session.",
 					);
 				}
 				return;

@@ -286,10 +286,11 @@ Then talk normally. That chat is bound to the desktop session file via RPC `swit
 | `/continue` | admin | Attach this chat to the last desktop Pi session |
 | `/session` | allowed users | Show the attached file and last desktop pointer |
 | `/detach` | allowed users | Go back to an isolated gateway session |
+| `/new` | allowed users | Start a fresh isolated conversation |
 
 If the session file was written in the last 15 seconds, `/continue` warns that the desktop Pi may still be live.
 
-On Discord these are also registered as **slash commands** (`/continue`, `/session`, `/detach`, `/model`, `/restart`). Global commands can take a few minutes to appear; DMs work after the bot shares a server with you. Re-invite the bot with the `applications.commands` scope if `/` shows nothing.
+On Discord these are also registered as **slash commands** (`/continue`, `/session`, `/detach`, `/new`, `/model`, `/restart`). Global commands can take a few minutes to appear; DMs work after the bot shares a server with you. Re-invite the bot with the `applications.commands` scope if `/` shows nothing.
 
 ## Commands
 

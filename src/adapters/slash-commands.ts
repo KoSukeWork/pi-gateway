@@ -12,6 +12,10 @@ export const DISCORD_SLASH_COMMANDS = [
 		description: "Use an isolated gateway session again",
 	},
 	{
+		name: "new",
+		description: "Start a fresh isolated conversation",
+	},
+	{
 		name: "model",
 		description: "List models, or switch with provider/id",
 		options: [
@@ -40,7 +44,7 @@ export function slashInteractionToContent(data: {
 		if (typeof id === "string" && id.trim()) return `/model ${id.trim()}`;
 		return "/model";
 	}
-	if (["continue", "session", "detach", "restart"].includes(name)) {
+	if (["continue", "session", "detach", "new", "restart"].includes(name)) {
 		return `/${name}`;
 	}
 	return null;
