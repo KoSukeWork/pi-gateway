@@ -84,6 +84,11 @@ export class TelegramAdapter extends BaseAdapter {
 
 		// Set webhook if URL configured; otherwise long polling is used
 		if (this.config.webhookUrl) {
+			if (!this.config.webhookSecret) {
+				throw new Error(
+					"Telegram webhookUrl requires webhookSecret so inbound updates can be authenticated",
+				);
+			}
 			await this.apiRequest("/setWebhook", {
 				method: "POST",
 				body: JSON.stringify({
@@ -602,9 +607,11 @@ export class TelegramAdapter extends BaseAdapter {
 	}
 
 	// Handle webhook update (called from HTTP handler)
-	async handleWebhookUpdate(update: any): Promise<void> {
+	async handleWebhookUpdate(update: any, secretHeader?: string): Promise<void> {
 		if (this.config.webhookSecret) {
-			// Verify secret here
+			if (secretHeader !== this.config.webhookSecret) {
+				throw new Error("Invalid Telegram webhook secret");
+			}
 		}
 		await this.handleUpdate(update);
 	}

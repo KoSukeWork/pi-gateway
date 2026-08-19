@@ -17,20 +17,28 @@ Multi-platform chat bridge for pi — connect your AI agent to Telegram, Discord
 
 ## Installation
 
-Install from npm (recommended):
+Install from the certified Fork (source, no build step):
+
+```bash
+pi install git:github.com/KoSukeWork/pi-gateway@<pinned-sha>
+```
+
+Or from npm:
 
 ```bash
 pi install npm:@gamalan/pi-gateway
 ```
 
-Or clone and build manually:
+Or clone locally:
 
 ```bash
-git clone https://github.com/gamalan/pi-gateway.git
+git clone https://github.com/KoSukeWork/pi-gateway.git
 cd pi-gateway
-npm install && npm run build
+npm install
 pi install .
 ```
+
+The Pi extension loads `src/index.ts` directly. Detached daemon mode (`/gateway start -d` / `pi-gateway start`) uses compiled `dist/` when present, otherwise `tsx` from dependencies.
 
 Requires pi coding agent (`@earendil-works/pi-coding-agent >= 0.80.3`) and `@sinclair/typebox >= 0.32.0`.
 
@@ -57,12 +65,12 @@ Configuration lives at `~/.pi/gateway/config.json`:
 {
   "port": 3847,
   "host": "localhost",
-  "tokens": [],                    // Bearer tokens for API auth (empty = allow all)
-  "corsOrigins": ["*"],
+  "tokens": ["replace-me"],        // Bearer tokens for HTTP/WS API (required unless host is loopback)
+  "corsOrigins": [],               // empty = no CORS wildcard
   "enableWebSocket": true,
   "enableHttp": true,
   "security": {
-    "allowAll": true,              // false = enforce allowlist
+    "allowAll": false,             // true = any chat user is allowed (unsafe)
     "requirePairing": false,
     "allowedUids": {},             // pre-approved users (see Security)
     "adminUids": {},              // users with full access (see Admin Users)
@@ -209,7 +217,9 @@ By default, external users are **restricted to read-only tools** when their mess
 
 The policy is enforced via a system directive prepended to every forwarded message. It is tunable per platform, per user, or globally.
 
-**Default allowed tools:** `read`, `web_search`, `fetch_content`, `fffind`, `ffgrep`, `module_report`, `read_symbol`, code search tools, `lsp_diagnostics`, `lsp_navigation`, `image_generate`, `gateway_*`
+**Default allowed tools:** `read`, `web_search`, `fetch_content`, `fffind`, `ffgrep`, `module_report`, `read_symbol`, code search tools, `lsp_diagnostics`, `lsp_navigation`, `image_generate`
+
+`gateway_*` is **not** allowed for external users. Only admins (who bypass the policy) can manage the gateway.
 
 **Default denied tools:** `bash`, `write`, `edit`, `subagent`, `todo`, `goal_complete`, `mcp`, `ast_grep_replace`, `agent_browser`, `wait`, `intercom`, `wiki_*`, `lens_diagnostics`
 

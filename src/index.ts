@@ -19,7 +19,6 @@ import { join } from "node:path";
 import {
 	existsSync,
 	readFileSync,
-	copyFileSync,
 	mkdirSync,
 	writeFileSync,
 	watchFile,
@@ -33,6 +32,7 @@ import {
 import { WebSocketServer, WebSocket } from "ws";
 import { randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
+import { isLoopbackHost, resolveDaemonInvocation, resolveRpcExtensionPath } from "./runtime-entry.js";
 
 import type {
 	ExtensionAPI,
@@ -184,11 +184,11 @@ const DEFAULT_CONFIG: GatewayConfig = {
 	port: 3847,
 	host: "localhost",
 	tokens: [],
-	corsOrigins: ["*"],
+	corsOrigins: [],
 	enableWebSocket: true,
 	enableHttp: true,
 	security: {
-		allowAll: true,
+		allowAll: false,
 		requirePairing: false,
 		allowedUids: {},
 		adminUids: {},
@@ -331,7 +331,18 @@ function loadConfig(): GatewayConfig {
 			);
 			if (existsSync(defaultConfigPath)) {
 				mkdirSync(GATEWAY_CONFIG_DIR, { recursive: true });
-				copyFileSync(defaultConfigPath, GATEWAY_CONFIG_FILE);
+				const seeded = JSON.parse(readFileSync(defaultConfigPath, "utf-8"));
+				if (!Array.isArray(seeded.tokens) || seeded.tokens.length === 0) {
+					seeded.tokens = [randomBytes(24).toString("base64url")];
+				}
+				if (!seeded.security || typeof seeded.security !== "object") {
+					seeded.security = {};
+				}
+				seeded.security.allowAll = false;
+				writeFileSync(
+					GATEWAY_CONFIG_FILE,
+					`${JSON.stringify(seeded, null, 2)}\n`,
+				);
 				logger.info("[gateway] Seeded default config at", GATEWAY_CONFIG_FILE);
 			}
 		}
@@ -351,7 +362,11 @@ function loadConfig(): GatewayConfig {
 
 // Token auth
 function verifyToken(token: string): boolean {
-	if (config.tokens.length === 0) return true;
+	if (config.tokens.length === 0) {
+		// Empty token list is only a convenience on loopback. Binding a public
+		// interface without tokens must fail closed.
+		return isLoopbackHost(config.host);
+	}
 	return config.tokens.includes(token);
 }
 
@@ -377,12 +392,7 @@ function broadcastClients(event: string, data: unknown): void {
 
 // RPC to pi agent
 function createRpcProcess(): any {
-	const extensionPath = join(
-		getPackageRoot(import.meta.url),
-		"dist",
-		"extensions",
-		"pi-gateway-ask-user-rpc.js",
-	);
+	const extensionPath = resolveRpcExtensionPath(import.meta.url);
 	const proc = spawn(
 		"pi",
 		[
@@ -1198,10 +1208,11 @@ async function handleHttpRequest(
 	req: IncomingMessage,
 	res: ServerResponse,
 ): Promise<void> {
-	res.setHeader(
-		"Access-Control-Allow-Origin",
-		config.corsOrigins.join(",") || "*",
-	);
+	const corsOrigin =
+		config.corsOrigins.length > 0 ? config.corsOrigins.join(",") : "";
+	if (corsOrigin) {
+		res.setHeader("Access-Control-Allow-Origin", corsOrigin);
+	}
 	res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
 	res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 
@@ -1221,14 +1232,23 @@ async function handleHttpRequest(
 				const body = JSON.parse(Buffer.concat(chunks).toString());
 				const telegram = state.adapters.get("telegram") as any;
 				if (telegram?.handleWebhookUpdate) {
-					await telegram.handleWebhookUpdate(body);
+					const secretHeader = req.headers["x-telegram-bot-api-secret-token"];
+					await telegram.handleWebhookUpdate(
+						body,
+						typeof secretHeader === "string" ? secretHeader : undefined,
+					);
 					res.writeHead(200);
 					res.end("ok");
 				} else {
 					res.writeHead(503);
 					res.end("Telegram adapter not running");
 				}
-			} catch {
+			} catch (error) {
+				if (error instanceof Error && error.message.includes("webhook secret")) {
+					res.writeHead(401);
+					res.end("Unauthorized");
+					return;
+				}
 				res.writeHead(400);
 				res.end("Invalid request");
 			}
@@ -1451,10 +1471,9 @@ export default function (pi: ExtensionAPI) {
 							return;
 						}
 
-						// Spawn detached daemon
-						const entryPoint = new URL("../dist/index.js", import.meta.url)
-							.pathname;
-						const child = spawn(process.execPath, [entryPoint, "--daemon"], {
+						// Spawn detached daemon from compiled JS or TypeScript source.
+						const daemon = resolveDaemonInvocation(import.meta.url);
+						const child = spawn(daemon.command, daemon.args, {
 							detached: true,
 							stdio: "ignore",
 							env: process.env,

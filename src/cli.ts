@@ -20,9 +20,9 @@ import {
 	waitForGatewayHealth,
 	type GatewayHealthConfig,
 } from "./status.js";
+import { resolveDaemonInvocation } from "./runtime-entry.js";
 
 const PID_FILE = join(homedir(), ".pi", "gateway", "gateway.pid");
-const DAEMON_ENTRY = new URL("../dist/index.js", import.meta.url).pathname;
 
 function isRunning(): { running: boolean; pid?: number } {
 	if (!existsSync(PID_FILE)) return { running: false };
@@ -109,7 +109,8 @@ switch (cmd) {
 		}
 
 		console.log("Starting gateway daemon...");
-		const child = spawn(process.execPath, [DAEMON_ENTRY, "--daemon"], {
+		const daemon = resolveDaemonInvocation(import.meta.url);
+		const child = spawn(daemon.command, daemon.args, {
 			detached: true,
 			stdio: "ignore",
 			env: process.env,

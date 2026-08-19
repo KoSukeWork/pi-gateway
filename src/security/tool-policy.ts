@@ -68,14 +68,8 @@ export interface EffectivePolicy {
  *   the gateway from within pi.
  */
 const DEFAULT_POLICIES: ToolPolicy[] = [
-	// ── Always allow gateway management tools ──
-	{
-		platform: null,
-		userId: null,
-		toolName: "gateway_*",
-		action: "allow",
-		priority: 100,
-	},
+	// gateway_* stays denied for external users. Those tools can change
+	// allowlists and policies; only admins (who bypass this list) may use them.
 
 	// ── Read-only inspection tools ──
 	{

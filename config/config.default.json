@@ -2,11 +2,11 @@
   "port": 3847,
   "host": "localhost",
   "tokens": [],
-  "corsOrigins": ["*"],
+  "corsOrigins": [],
   "enableWebSocket": true,
   "enableHttp": true,
   "security": {
-    "allowAll": true,
+    "allowAll": false,
     "requirePairing": false,
     "allowedUids": {},
     "adminUids": {},
