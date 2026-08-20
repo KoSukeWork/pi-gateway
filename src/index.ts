@@ -697,10 +697,14 @@ const adapterCallbacks: AdapterCallbacks = {
 			logger.info(`[gateway] User ${message.userId} not in allowlist`);
 			const adapter = state.adapters.get(message.platform);
 			if (adapter) {
-				await adapter.sendMessage(
-					message.channelId,
-					"You are not allowed to use this agent. Contact the administrator to request access.",
-				);
+				try {
+					await adapter.sendMessage(
+						message.channelId,
+						"You are not allowed to use this agent. Contact the administrator to request access.",
+					);
+				} catch (error) {
+					logger.error("[gateway] Failed to send allowlist rejection:", error);
+				}
 			}
 			return;
 		}

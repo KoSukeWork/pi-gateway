@@ -245,6 +245,7 @@ export function isUserAllowed(platform: Platform, userId: string): boolean {
 	// Check global allow all first
 	const config = getSecurityConfig();
 	if (config.allowAll === true) return true;
+	if (isAdmin(platform, userId)) return true;
 
 	// Check config-based allowedUids (cross-platform wildcard or platform-specific)
 	if (config.allowedUids) {

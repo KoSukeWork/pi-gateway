@@ -31,6 +31,17 @@ export interface DiscordConfig extends PlatformConfig {
   requireMention?: boolean;    // Require @mention in guilds
 }
 
+/** Drop bot/self messages so the bot cannot allowlist-loop on its own replies. */
+export function shouldIgnoreDiscordAuthor(
+  author: { id?: string; bot?: boolean } | null | undefined,
+  botId?: string | null,
+): boolean {
+  if (!author?.id) return true;
+  if (author.bot) return true;
+  if (botId && author.id === botId) return true;
+  return false;
+}
+
 export class DiscordAdapter extends BaseAdapter {
   readonly platform = "discord" as const;
   config: DiscordConfig;
@@ -171,9 +182,8 @@ export class DiscordAdapter extends BaseAdapter {
   }
 
   private async handleMessage(data: any): Promise<void> {
-    // Ignore bots
-    if (data.author.bot && data.author.id !== this.getBotId()) return;
-    
+    if (shouldIgnoreDiscordAuthor(data.author, this.getBotId())) return;
+
     // Check if DM or allowed channel
     const isDM = !data.guild_id;
     if (!isDM && this.config.allowedChannels?.length) {
@@ -201,7 +211,7 @@ export class DiscordAdapter extends BaseAdapter {
       },
     };
 
-    await this.callbacks?.onMessage(message);
+    await this.emitMessage(message);
   }
 
   private getBotId(): string {
@@ -321,6 +331,9 @@ export class DiscordAdapter extends BaseAdapter {
 
     if (!response.ok) {
       const error = await response.text();
+      if (response.status === 429) {
+        logger.warn(`[Discord] Rate limited while sending: ${error}`);
+      }
       throw new Error(`Failed to send message: ${error}`);
     }
 

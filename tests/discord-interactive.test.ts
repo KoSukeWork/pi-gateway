@@ -6,6 +6,7 @@ import {
 	truncateDiscordContent,
 	truncateDiscordLabel,
 } from "../src/adapters/discord-interactive.js";
+import { shouldIgnoreDiscordAuthor } from "../src/adapters/discord.js";
 
 assert.equal(truncateDiscordContent("short"), "short");
 assert.ok(truncateDiscordContent("x".repeat(5000)).length <= DISCORD_CONTENT_MAX);
@@ -81,5 +82,22 @@ const input = buildDiscordInteractiveMessage({
 });
 assert.equal(input.components.length, 0);
 assert.ok(input.content.includes("Reply with your input"));
+
+assert.equal(
+	shouldIgnoreDiscordAuthor({ id: "1539471422685184121", bot: true }, "1539471422685184121"),
+	true,
+);
+assert.equal(
+	shouldIgnoreDiscordAuthor({ id: "1539471422685184121", bot: false }, "1539471422685184121"),
+	true,
+);
+assert.equal(
+	shouldIgnoreDiscordAuthor({ id: "other-bot", bot: true }, "1539471422685184121"),
+	true,
+);
+assert.equal(
+	shouldIgnoreDiscordAuthor({ id: "602673044028129287", bot: false }, "1539471422685184121"),
+	false,
+);
 
 console.log("discord-interactive tests passed");
