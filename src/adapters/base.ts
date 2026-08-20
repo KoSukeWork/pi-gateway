@@ -58,7 +58,10 @@ export interface AdapterCallbacks {
 	onTyping?: (userId: string, isTyping: boolean) => void;
 	onDisconnect?: () => void;
 	/** Fired when a user responds to an interactive prompt (button click, reply). */
-	onInteractiveResponse?: (response: InteractiveResponse) => void;
+	onInteractiveResponse?: (
+		response: InteractiveResponse,
+		fromUserId?: string,
+	) => void;
 }
 
 export interface PlatformAdapter {

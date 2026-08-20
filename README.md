@@ -14,6 +14,7 @@ Multi-platform chat bridge for pi — connect your AI agent to Telegram, Discord
 - **Detached daemon mode** — `/gateway start -d` or `pi-gateway start -d` keeps the gateway alive after pi closes
 - **HTTP + WebSocket API** — connect external clients, send prompts, receive streaming responses
 - **pi-native** — runs as a pi extension with `/gateway` slash commands and registered tools
+- **Interactive prompts** — `ctx.ui.select()` / `confirm()` / `input()` (including permission-plugin asks) are forwarded to chat. Telegram and Discord use buttons; you can also reply with the number. Unanswered dialogs cancel after 2 minutes so the RPC agent cannot hang.
 
 ## Installation
 

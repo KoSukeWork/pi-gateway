@@ -124,6 +124,9 @@ import {
 	setFlushHandler,
 	flushHandler,
 	cleanupPendingUiRequests,
+	cancelUiRequest,
+	isDialogUiMethod,
+	tryConsumeTextReply,
 } from "./interactive.js";
 
 // Types
@@ -465,18 +468,26 @@ function createRpcProcess(): any {
 				// Handle extension UI requests (select, confirm, input, etc.)
 				if (msg.type === "extension_ui_request") {
 					const active = getActiveChannel();
-					if (active) {
-						const adapter = state.adapters.get(active.platform);
-						if (adapter) {
-							// Flush full accumulated text into the placeholder NOW
-							flushHandler?.();
-							handleExtensionUiRequest(msg, adapter).catch((err) => {
-								logger.error(
-									"[gateway] Failed to handle extension UI request:",
-									err,
-								);
-							});
-						}
+					const adapter = active
+						? state.adapters.get(active.platform)
+						: undefined;
+					if (adapter) {
+						// Flush full accumulated text into the placeholder NOW
+						flushHandler?.();
+						handleExtensionUiRequest(msg, adapter).catch((err) => {
+							logger.error(
+								"[gateway] Failed to handle extension UI request:",
+								err,
+							);
+							if (isDialogUiMethod(msg.method)) {
+								cancelUiRequest(msg.id);
+							}
+						});
+					} else if (isDialogUiMethod(msg.method)) {
+						logger.warn(
+							"[gateway] No adapter for extension UI request — cancelling so Pi cannot hang",
+						);
+						cancelUiRequest(msg.id);
 					}
 				}
 
@@ -698,6 +709,17 @@ const adapterCallbacks: AdapterCallbacks = {
 		state.sessions.set(`${message.platform}:${message.channelId}`, session);
 
 		const sessionCmd = message.content.trim();
+		if (
+			!sessionCmd.startsWith("/") &&
+			tryConsumeTextReply(
+				message.platform,
+				message.channelId,
+				message.content,
+				message.userId,
+			)
+		) {
+			return;
+		}
 		if (/^\/(continue|session|detach|new)$/i.test(sessionCmd)) {
 			const adapter = state.adapters.get(message.platform);
 			if (!rpcProcess) {
@@ -1070,6 +1092,7 @@ const adapterCallbacks: AdapterCallbacks = {
 			setActiveChannel({
 				platform: message.platform,
 				channelId: message.channelId,
+				userId: message.userId,
 			});
 
 			let preText = "";
@@ -1193,8 +1216,8 @@ const adapterCallbacks: AdapterCallbacks = {
 			logger.warn("[gateway] pi agent not running — cannot process message");
 		}
 	},
-	onInteractiveResponse: (response: InteractiveResponse) => {
-		handleInteractiveResponse(response);
+	onInteractiveResponse: (response: InteractiveResponse, fromUserId?: string) => {
+		handleInteractiveResponse(response, fromUserId);
 	},
 	onDisconnect: () => {
 		logger.info("[gateway] Platform adapter disconnected");

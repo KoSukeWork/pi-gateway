@@ -9,9 +9,18 @@
  * - Rate limit handling
  */
 
-import { BaseAdapter, type PlatformMessage, type PlatformConfig } from "./base.js";
+import {
+  BaseAdapter,
+  type InteractivePrompt,
+  type PlatformConfig,
+  type PlatformMessage,
+} from "./base.js";
 import { logger } from "../logger.js";
 import { DISCORD_SLASH_COMMANDS, slashInteractionToContent } from "./slash-commands.js";
+import {
+  buildDiscordInteractiveMessage,
+  parseDiscordButtonCustomId,
+} from "./discord-interactive.js";
 
 export interface DiscordConfig extends PlatformConfig {
   platform: "discord";
@@ -205,6 +214,12 @@ export class DiscordAdapter extends BaseAdapter {
   }
 
   private async handleInteraction(data: any): Promise<void> {
+    // 3 = MESSAGE_COMPONENT (button / select menu)
+    if (data.type === 3) {
+      await this.handleComponentInteraction(data);
+      return;
+    }
+    // 2 = APPLICATION_COMMAND (slash)
     if (data.type !== 2) return;
     const content = slashInteractionToContent(data.data ?? {});
     if (!content) return;
@@ -240,10 +255,68 @@ export class DiscordAdapter extends BaseAdapter {
     await this.callbacks?.onMessage(message);
   }
 
+  private async handleComponentInteraction(data: any): Promise<void> {
+    const customId: string = data.data?.custom_id ?? "";
+    const parsed = parseDiscordButtonCustomId(customId);
+    const userId = data.member?.user?.id ?? data.user?.id;
+
+    try {
+      await this.apiRequest(`/interactions/${data.id}/${data.token}/callback`, {
+        method: "POST",
+        body: JSON.stringify({
+          type: 7,
+          data: { components: [] },
+        }),
+      });
+    } catch (error) {
+      logger.error("[Discord] Failed to acknowledge button interaction:", error);
+    }
+
+    if (!parsed) {
+      logger.warn(`[Discord] Unknown interactive custom_id: ${customId}`);
+      return;
+    }
+    this.callbacks?.onInteractiveResponse?.(parsed, userId);
+  }
+
+  async sendInteractive(
+    channelId: string,
+    prompt: InteractivePrompt,
+  ): Promise<{ messageId: string }> {
+    const payload = buildDiscordInteractiveMessage(prompt);
+    if (!payload.content && payload.components.length === 0) {
+      return { messageId: "0" };
+    }
+    const messageId = await this.sendDiscordMessage(channelId, payload);
+    return { messageId };
+  }
+
+  override async cleanupInteractive(
+    channelId: string,
+    messageId: string,
+  ): Promise<void> {
+    if (!messageId || messageId === "0") return;
+    try {
+      await this.apiRequest(`/channels/${channelId}/messages/${messageId}`, {
+        method: "PATCH",
+        body: JSON.stringify({ components: [] }),
+      });
+    } catch (error) {
+      logger.warn("[Discord] Failed to clear interactive components:", error);
+    }
+  }
+
   async sendMessage(channelId: string, content: string): Promise<string> {
+    return this.sendDiscordMessage(channelId, { content });
+  }
+
+  private async sendDiscordMessage(
+    channelId: string,
+    body: { content: string; components?: ReturnType<typeof buildDiscordInteractiveMessage>["components"] },
+  ): Promise<string> {
     const response = await this.apiRequest(`/channels/${channelId}/messages`, {
       method: "POST",
-      body: JSON.stringify({ content }),
+      body: JSON.stringify(body),
     });
 
     if (!response.ok) {

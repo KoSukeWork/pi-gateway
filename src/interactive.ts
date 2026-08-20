@@ -7,6 +7,11 @@
  *   ctx.ui.select(), ctx.ui.confirm(), ctx.ui.input(), etc.
  *   The gateway displays these to the user and sends
  *   extension_ui_response back on pi's stdin.
+ *
+ * Dialog methods (select/confirm/input/editor) MUST always get a response
+ * or Pi's tool_call hangs with no timeout of its own. This module cancels
+ * when: send fails, there is no active channel, the user ignores the prompt
+ * long enough, or the agent ends.
  */
 
 import type { BaseAdapter } from "./adapters/base.js";
@@ -59,6 +64,23 @@ export interface InteractiveResponse {
 export interface ActiveChannel {
 	platform: string;
 	channelId: string;
+	userId?: string;
+}
+
+export const DIALOG_UI_METHODS = [
+	"select",
+	"confirm",
+	"input",
+	"editor",
+] as const;
+
+export type DialogUiMethod = (typeof DIALOG_UI_METHODS)[number];
+
+/** Default wait for a human answer when Pi did not send `timeout`. */
+export const DEFAULT_INTERACTIVE_TIMEOUT_MS = 120_000;
+
+export function isDialogUiMethod(method: string): method is DialogUiMethod {
+	return (DIALOG_UI_METHODS as readonly string[]).includes(method);
 }
 
 // ── State ───────────────────────────────────────────────────────────────────
@@ -67,9 +89,12 @@ interface PendingUiRequest {
 	requestId: string;
 	platform: string;
 	channelId: string;
+	userId?: string;
 	messageId: string;
 	adapter: BaseAdapter;
+	method: DialogUiMethod;
 	options?: string[];
+	timeoutHandle?: ReturnType<typeof setTimeout>;
 }
 
 const pendingUiRequests = new Map<string, PendingUiRequest>();
@@ -108,6 +133,38 @@ export function getActiveChannel(): ActiveChannel | null {
 	return activeChannel;
 }
 
+export function pendingUiCount(): number {
+	return pendingUiRequests.size;
+}
+
+/** Test helper — drop pending state without talking to Pi. */
+export function resetInteractiveStateForTests(): void {
+	for (const pending of pendingUiRequests.values()) {
+		if (pending.timeoutHandle) clearTimeout(pending.timeoutHandle);
+	}
+	pendingUiRequests.clear();
+	activeChannel = null;
+	writeToStdin = null;
+	streamRedirectHandler = null;
+	flushHandler = null;
+}
+
+/**
+ * Tell Pi this dialog was cancelled so a tool_call cannot hang.
+ * Safe to call if the id is unknown — Pi ignores unmatched responses.
+ */
+export function cancelUiRequest(requestId: string): void {
+	const pending = pendingUiRequests.get(requestId);
+	if (pending?.timeoutHandle) clearTimeout(pending.timeoutHandle);
+	if (pending) {
+		pendingUiRequests.delete(requestId);
+		pending.adapter
+			.cleanupInteractive?.(pending.channelId, pending.messageId)
+			.catch(() => {});
+	}
+	sendUiResponse(requestId, { requestId, cancelled: true });
+}
+
 /**
  * Handle an extension_ui_request event from pi's stdout.
  * Called from the RPC stdout handler in index.ts.
@@ -118,6 +175,9 @@ export async function handleExtensionUiRequest(
 ): Promise<void> {
 	if (!activeChannel) {
 		logger.warn("[interactive] No active channel — cannot route UI request");
+		if (isDialogUiMethod(msg.method)) {
+			cancelUiRequest(msg.id);
+		}
 		return;
 	}
 
@@ -159,25 +219,120 @@ export async function handleExtensionUiRequest(
 			logger.error(
 				`[interactive] sendInteractive returned no messageId for ${msg.method} — auto-cancelling`,
 			);
-			sendUiResponse(msg.id, { requestId: msg.id, cancelled: true });
+			cancelUiRequest(msg.id);
 			return;
 		}
+		const timeoutMs =
+			msg.timeout && msg.timeout > 0
+				? msg.timeout
+				: DEFAULT_INTERACTIVE_TIMEOUT_MS;
+		const timeoutHandle = setTimeout(() => {
+			if (!pendingUiRequests.has(msg.id)) return;
+			logger.warn(
+				`[interactive] Timed out waiting for ${msg.method} ${msg.id.slice(0, 8)}… after ${timeoutMs}ms`,
+			);
+			cancelUiRequest(msg.id);
+		}, timeoutMs);
 		pendingUiRequests.set(msg.id, {
 			requestId: msg.id,
 			platform: activeChannel.platform,
 			channelId: activeChannel.channelId,
+			userId: activeChannel.userId,
 			messageId: result.messageId,
 			adapter,
+			method: msg.method as DialogUiMethod,
 			options: msg.options,
+			timeoutHandle,
 		});
 		logger.info(
 			`[interactive] Sent ${msg.method} prompt ${msg.id.slice(0, 8)}… to ${activeChannel.platform}/${activeChannel.channelId}`,
 		);
 	} catch (err) {
 		logger.error("[interactive] Failed to send interactive prompt:", err);
-		// Auto-cancel so pi doesn't hang
-		sendUiResponse(msg.id, { requestId: msg.id, cancelled: true });
+		cancelUiRequest(msg.id);
 	}
+}
+
+/**
+ * Parse a free-text reply against a pending dialog.
+ * Returns null when the text should NOT be consumed (unrelated chatter).
+ */
+export function parseInteractiveTextReply(
+	content: string,
+	pending: { method: DialogUiMethod; options?: string[] },
+): Omit<InteractiveResponse, "requestId"> | null {
+	const text = content.trim();
+	if (!text) return null;
+
+	if (pending.method === "select") {
+		const options = pending.options ?? [];
+		if (/^\d+$/.test(text)) {
+			const asNum = parseInt(text, 10);
+			if (asNum >= 1 && asNum <= options.length) {
+				return { value: String(asNum - 1) };
+			}
+			return null;
+		}
+		const exact = options.find(
+			(option) => option.toLowerCase() === text.toLowerCase(),
+		);
+		if (exact) return { value: exact };
+		if (/^(y|yes)$/i.test(text)) {
+			const yes = options.find((option) => option.toLowerCase() === "yes");
+			if (yes) return { value: yes };
+		}
+		if (/^(n|no)$/i.test(text)) {
+			const no = options.find((option) => option.toLowerCase() === "no");
+			if (no) return { value: no };
+		}
+		return null;
+	}
+
+	if (pending.method === "confirm") {
+		if (/^(y|yes|true|1)$/i.test(text)) return { confirmed: true };
+		if (/^(n|no|false|0)$/i.test(text)) return { confirmed: false };
+		return null;
+	}
+
+	if (pending.method === "input" || pending.method === "editor") {
+		return { value: text };
+	}
+
+	return null;
+}
+
+function latestPendingForChannel(
+	platform: string,
+	channelId: string,
+): PendingUiRequest | undefined {
+	let match: PendingUiRequest | undefined;
+	for (const pending of pendingUiRequests.values()) {
+		if (pending.platform === platform && pending.channelId === channelId) {
+			match = pending;
+		}
+	}
+	return match;
+}
+
+/**
+ * If this channel has a pending dialog and `content` answers it, resolve
+ * the dialog and return true so the caller does not treat it as a new prompt.
+ */
+export function tryConsumeTextReply(
+	platform: string,
+	channelId: string,
+	content: string,
+	userId?: string,
+): boolean {
+	const pending = latestPendingForChannel(platform, channelId);
+	if (!pending) return false;
+	if (pending.userId && userId && pending.userId !== userId) {
+		return false;
+	}
+	const parsed = parseInteractiveTextReply(content, pending);
+	if (!parsed) return false;
+	handleInteractiveResponse({ requestId: pending.requestId, ...parsed });
+	return true;
 }
 
 /**
@@ -187,7 +342,10 @@ export async function handleExtensionUiRequest(
  * If requestId is empty, looks up the most recent pending request
  * for the active channel (used for ForceReply responses on Telegram).
  */
-export function handleInteractiveResponse(response: InteractiveResponse): void {
+export function handleInteractiveResponse(
+	response: InteractiveResponse,
+	fromUserId?: string,
+): void {
 	let pending = response.requestId
 		? pendingUiRequests.get(response.requestId)
 		: undefined;
@@ -195,16 +353,11 @@ export function handleInteractiveResponse(response: InteractiveResponse): void {
 	// Fallback for ForceReply: if no requestId, find the most recent
 	// pending request for the current active channel.
 	if (!pending && activeChannel) {
-		for (const [, p] of pendingUiRequests) {
-			if (
-				p.platform === activeChannel.platform &&
-				p.channelId === activeChannel.channelId
-			) {
-				pending = p;
-				response.requestId = p.requestId;
-				break;
-			}
-		}
+		pending = latestPendingForChannel(
+			activeChannel.platform,
+			activeChannel.channelId,
+		);
+		if (pending) response.requestId = pending.requestId;
 	}
 
 	if (!pending) {
@@ -214,20 +367,36 @@ export function handleInteractiveResponse(response: InteractiveResponse): void {
 		return;
 	}
 
+	if (pending.userId && fromUserId && pending.userId !== fromUserId) {
+		logger.warn(
+			`[interactive] Ignoring response for ${pending.requestId.slice(0, 8)}… from other user ${fromUserId}`,
+		);
+		return;
+	}
+
 	logger.info(
 		`[interactive] Response for ${response.requestId.slice(0, 8)}…: ${response.value ?? (response.confirmed ? "confirmed" : "?")}${response.cancelled ? " (cancelled)" : ""}`,
 	);
 
 	// Resolve index-based select responses back to option text
-	// (telegram uses indices in callback_data to stay under the 64-byte limit)
+	// (telegram/discord use indices in callback_data to stay under size limits)
 	if (response.value !== undefined && pending.options) {
 		const idx = parseInt(response.value, 10);
-		if (!isNaN(idx) && idx >= 0 && idx < pending.options.length) {
+		if (
+			/^\d+$/.test(response.value) &&
+			!isNaN(idx) &&
+			idx >= 0 &&
+			idx < pending.options.length
+		) {
 			response.value = pending.options[idx];
 		}
 	}
 
+	if (pending.timeoutHandle) clearTimeout(pending.timeoutHandle);
 	pendingUiRequests.delete(response.requestId);
+	pending.adapter
+		.cleanupInteractive?.(pending.channelId, pending.messageId)
+		.catch(() => {});
 	sendUiResponse(response.requestId, response);
 
 	// Redirect subsequent streaming to a new message after select/confirm
@@ -242,16 +411,14 @@ export function handleInteractiveResponse(response: InteractiveResponse): void {
 /**
  * Clean up all pending interactive prompts.
  * Called on agent_end or when the active channel changes.
+ * Cancels any still-open dialog so Pi cannot hang on ctx.ui.select().
  */
 export function cleanupPendingUiRequests(): void {
-	for (const [id, pending] of pendingUiRequests) {
+	const ids = [...pendingUiRequests.keys()];
+	for (const id of ids) {
 		logger.info(`[interactive] Cleaning up pending request ${id.slice(0, 8)}…`);
-		// Try to remove interactive elements from the message
-		pending.adapter
-			.cleanupInteractive?.(pending.channelId, pending.messageId)
-			.catch(() => {});
+		cancelUiRequest(id);
 	}
-	pendingUiRequests.clear();
 }
 
 // ── Internal ────────────────────────────────────────────────────────────────
