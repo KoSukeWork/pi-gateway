@@ -29,8 +29,14 @@ const BLOCKING_EVENTS = [
 
 type ExtensionFactory = (pi: ExtensionAPI) => unknown;
 type CommandHandler = (args: string, ctx: unknown) => unknown;
+type CompletionItem = { value: string; label: string; description?: string };
+type CompletionsFn = (prefix: string) => CompletionItem[] | null | undefined;
 
-export type DeferredCommand = { name: string; description: string };
+export type DeferredCommand = {
+	name: string;
+	description: string;
+	completions?: Array<string | CompletionItem>;
+};
 
 function tryRefreshAutocomplete(pi: ExtensionAPI): void {
 	try {
@@ -41,10 +47,21 @@ function tryRefreshAutocomplete(pi: ExtensionAPI): void {
 	}
 }
 
+function filterStaticCompletions(
+	items: Array<string | CompletionItem> | undefined,
+	prefix: string,
+): CompletionItem[] | null {
+	if (!items?.length) return null;
+	const mapped = items.map((item) => (typeof item === "string" ? { value: item, label: item } : item));
+	const hits = mapped.filter((item) => item.value.startsWith(prefix));
+	return hits.length > 0 ? hits : null;
+}
+
 function wrapRuntimePi(
 	pi: ExtensionAPI,
 	pending: Map<string, { event: unknown; ctx: unknown }>,
 	realCommands: Map<string, CommandHandler>,
+	realCompletions: Map<string, CompletionsFn>,
 ): ExtensionAPI {
 	const origOn = pi.on.bind(pi);
 	const origRegisterCommand = pi.registerCommand.bind(pi);
@@ -64,8 +81,18 @@ function wrapRuntimePi(
 				};
 			}
 			if (prop === "registerCommand") {
-				return (name: string, options: { handler: CommandHandler; description?: string; getArgumentCompletions?: unknown }) => {
+				return (
+					name: string,
+					options: {
+						handler: CommandHandler;
+						description?: string;
+						getArgumentCompletions?: CompletionsFn;
+					},
+				) => {
 					realCommands.set(name, options.handler);
+					if (typeof options.getArgumentCompletions === "function") {
+						realCompletions.set(name, options.getArgumentCompletions);
+					}
 					return origRegisterCommand(name, options as never);
 				};
 			}
@@ -82,7 +109,8 @@ export function installDeferred(
 ): void {
 	const pending = new Map<string, { event: unknown; ctx: unknown }>();
 	const realCommands = new Map<string, CommandHandler>();
-	const runtimePi = wrapRuntimePi(pi, pending, realCommands);
+	const realCompletions = new Map<string, CompletionsFn>();
+	const runtimePi = wrapRuntimePi(pi, pending, realCommands, realCompletions);
 	let ready: Promise<unknown> | undefined;
 
 	const ensure = () => {
@@ -109,6 +137,12 @@ export function installDeferred(
 	for (const command of options.commands ?? []) {
 		pi.registerCommand(command.name, {
 			description: command.description,
+			getArgumentCompletions: (prefix: string) => {
+				void ensure();
+				const real = realCompletions.get(command.name);
+				if (real) return real(prefix);
+				return filterStaticCompletions(command.completions, prefix);
+			},
 			handler: async (args, ctx) => {
 				await ensure();
 				const handler = realCommands.get(command.name);
