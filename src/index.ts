@@ -34,6 +34,7 @@ import { randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
 import { isLoopbackHost, resolveDaemonInvocation, resolveRpcExtensionPath } from "./runtime-entry.js";
 import { buildRpcPiArgs, resolvePiInvocation } from "./resolve-pi.js";
+import { routeChatMessage } from "./prompt-routing.js";
 
 import type {
 	ExtensionAPI,
@@ -639,6 +640,19 @@ function extractAgentEndText(agentEndMsg: Record<string, unknown>): string {
 // Unlike sendRpc (which resolves with the ACK), this resolves with the
 // actual assistant response text after the agent finishes processing.
 // If onStream is provided, it is called with accumulated text as deltas arrive.
+function isAgentBusy(): boolean {
+	return pendingCompletions.length > 0;
+}
+
+async function sendSteerRpc(message: string): Promise<void> {
+	const ackResponse = await sendRpc("steer", { message });
+	const ack = ackResponse as Record<string, unknown>;
+	if (!ack.success) {
+		throw new Error(`Steer rejected: ${JSON.stringify(ackResponse)}`);
+	}
+	logger.info("[gateway] Steer ACK received");
+}
+
 async function sendPromptRpc(
 	message: string,
 	onStream?: (text: string) => void,
@@ -1069,6 +1083,27 @@ const adapterCallbacks: AdapterCallbacks = {
 		if (rpcProcess) {
 			const adapter = state.adapters.get(message.platform);
 			const guard = buildPolicyGuard(message.platform, message.userId);
+
+			if (routeChatMessage(isAgentBusy()) === "steer") {
+				try {
+					logger.info(
+						`[gateway] Steering from ${message.platform}/${message.userId}`,
+					);
+					await sendSteerRpc(message.content);
+					if (adapter) {
+						await adapter.sendMessage(
+							message.channelId,
+							"↪️ 已加入引导。当前这轮工具跑完后会按这个调整。",
+						);
+					}
+					return;
+				} catch (err) {
+					logger.warn(
+						"[gateway] Steer failed, falling back to a new prompt:",
+						err,
+					);
+				}
+			}
 
 			// Send an initial placeholder message so we can stream edits into it
 			let sentId: string | undefined;
