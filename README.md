@@ -16,6 +16,7 @@ Multi-platform chat bridge for pi — connect your AI agent to Telegram, Discord
 - **pi-native** — runs as a pi extension with `/gateway` slash commands and registered tools
 - **Interactive prompts** — `ctx.ui.select()` / `confirm()` / `input()` (including permission-plugin asks) are forwarded to chat. Telegram and Discord use buttons; you can also reply with the number. Unanswered dialogs cancel after 2 minutes so the RPC agent cannot hang.
 - **Mid-run steer** — if you send another chat message while the agent is busy (including waiting on a permission button), it is queued as Pi `steer` instead of being rejected.
+- **Session identity cards** — `/continue` and `/session` show project, model, and last messages instead of only a jsonl path
 
 ## Installation
 
@@ -283,10 +284,12 @@ The gateway still cannot share the live TUI process. It *can* reopen the same se
 
 Then talk normally. That chat is bound to the desktop session file via RPC `switch_session`.
 
+`/continue` and `/session` reply with an identity card (project path, last activity, model, first/last user text, last assistant text) so you can tell whether the attached file is the conversation you meant. Discord does not replay the desktop transcript; this preview is the context you get before talking.
+
 | Chat command | Who | Effect |
 |---|---|---|
 | `/continue` | admin | Attach this chat to the last desktop Pi session |
-| `/session` | allowed users | Show the attached file and last desktop pointer |
+| `/session` | allowed users | Show project, last messages, and attached session |
 | `/detach` | allowed users | Go back to an isolated gateway session |
 | `/new` | allowed users | Start a fresh isolated conversation |
 

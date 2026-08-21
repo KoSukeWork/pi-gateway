@@ -57,6 +57,10 @@ import {
 	sessionFileAgeMs,
 	setChannelBinding,
 } from "./sessions/active-session.js";
+import {
+	buildContinueMessage,
+	buildSessionStatusMessage,
+} from "./sessions/session-preview.js";
 import { logger } from "./logger.js";
 import {
 	GATEWAY_CONFIG_DIR,
@@ -748,15 +752,15 @@ const adapterCallbacks: AdapterCallbacks = {
 			if (cmd === "session") {
 				const active = readActiveSession();
 				const bound = getChannelBinding(message.platform, message.channelId);
-				const lines = [
-					bound
-						? `This chat is attached to:\n${bound.sessionFile}`
-						: "This chat is using an isolated gateway session.",
-					active
-						? `Last desktop Pi session:\n${active.sessionFile}`
-						: "No desktop Pi session has been published yet.",
-				];
-				if (adapter) await adapter.sendMessage(message.channelId, lines.join("\n\n"));
+				if (adapter) {
+					await adapter.sendMessage(
+						message.channelId,
+						buildSessionStatusMessage({
+							boundFile: bound?.sessionFile ?? null,
+							active,
+						}),
+					);
+				}
 				return;
 			}
 			if (cmd === "detach" || cmd === "new") {
@@ -799,14 +803,13 @@ const adapterCallbacks: AdapterCallbacks = {
 				await switchRpcSession(active.sessionFile);
 				setChannelBinding(message.platform, message.channelId, active.sessionFile);
 				const age = sessionFileAgeMs(active.sessionFile);
-				const hot =
-					age !== null && age < 15_000
-						? "\n\nWarning: that session file was written in the last 15s. Close the desktop Pi window first or the two sides may race."
-						: "";
 				if (adapter) {
 					await adapter.sendMessage(
 						message.channelId,
-						`Attached to desktop session${active.sessionId ? ` ${active.sessionId}` : ""}.\n${active.sessionFile}${hot}`,
+						buildContinueMessage({
+							active,
+							hot: age !== null && age < 15_000,
+						}),
 					);
 				}
 			} catch (error) {

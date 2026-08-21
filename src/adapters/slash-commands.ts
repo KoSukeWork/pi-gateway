@@ -5,7 +5,7 @@ export const DISCORD_SLASH_COMMANDS = [
 	},
 	{
 		name: "session",
-		description: "Show the attached desktop session",
+		description: "Show project, last messages, and attached session",
 	},
 	{
 		name: "detach",
