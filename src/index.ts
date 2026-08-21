@@ -34,7 +34,11 @@ import { randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
 import { isLoopbackHost, resolveDaemonInvocation, resolveRpcExtensionPath } from "./runtime-entry.js";
 import { buildRpcPiArgs, resolvePiInvocation } from "./resolve-pi.js";
-import { routeChatMessage } from "./prompt-routing.js";
+import {
+	isAgentAlreadyProcessingError,
+	routeChatMessage,
+	stillWorkingNotice,
+} from "./prompt-routing.js";
 
 import type {
 	ExtensionAPI,
@@ -233,7 +237,7 @@ const DEFAULT_CONFIG: GatewayConfig = {
 		dailyHour: 4,
 		idleMinutes: 1440,
 	},
-	promptTimeoutMs: 300000, // 5 minutes — override to increase for slow models
+	promptTimeoutMs: 300000, // still-working notice interval; 0 disables. Completions wait until agent_end.
 	platforms: {},
 };
 
@@ -292,13 +296,20 @@ const pendingRequests: PendingRequest[] = [];
 interface PendingCompletion {
 	resolve: (text: string) => void;
 	reject: (err: Error) => void;
-	timer: ReturnType<typeof setTimeout>;
+	timer: ReturnType<typeof setInterval> | null;
 	/** Called with accumulated streaming text as deltas arrive */
 	onStream?: (text: string) => void;
+	onSlow?: (elapsedMs: number) => void;
 	/** Accumulated streamed text from text_delta events */
 	streamedText: string;
 }
 const pendingCompletions: PendingCompletion[] = [];
+let rpcTurnActive = false;
+
+function clearCompletionTimer(completion: PendingCompletion): void {
+	if (completion.timer) clearInterval(completion.timer);
+	completion.timer = null;
+}
 
 // Load/save config
 function mergeGatewayConfig(value: unknown): GatewayConfig {
@@ -477,10 +488,19 @@ function createRpcProcess(): any {
 					logger.info(
 						`[gateway] agent_end received, text length: ${text.length}`,
 					);
+					rpcTurnActive = false;
+					const active = getActiveChannel();
 					const completion = pendingCompletions.shift();
 					if (completion) {
-						clearTimeout(completion.timer);
 						completion.resolve(text);
+					} else if (text.trim() && active) {
+						const lateAdapter = state.adapters.get(active.platform);
+						logger.warn(
+							`[gateway] Orphan agent_end — delivering ${text.length} chars to ${active.platform}/${active.channelId}`,
+						);
+						lateAdapter?.sendMessage(active.channelId, text).catch((error) => {
+							logger.error("[gateway] Failed to deliver orphan agent_end:", error);
+						});
 					}
 					// Clean up any pending interactive prompts
 					cleanupPendingUiRequests();
@@ -555,7 +575,6 @@ function createRpcProcess(): any {
 					);
 					const completion = pendingCompletions.shift();
 					if (completion) {
-						clearTimeout(completion.timer);
 						completion.resolve(text);
 					}
 				}
@@ -564,9 +583,9 @@ function createRpcProcess(): any {
 			}
 		}
 		// Reject any remaining pending completions so they don't hang forever
+		rpcTurnActive = false;
 		while (pendingCompletions.length > 0) {
 			const completion = pendingCompletions.shift()!;
-			clearTimeout(completion.timer);
 			completion.reject(new Error(`pi process exited with code ${code}`));
 		}
 		// Clean up any pending interactive UI requests
@@ -662,7 +681,7 @@ function extractAgentEndText(agentEndMsg: Record<string, unknown>): string {
 // actual assistant response text after the agent finishes processing.
 // If onStream is provided, it is called with accumulated text as deltas arrive.
 function isAgentBusy(): boolean {
-	return pendingCompletions.length > 0;
+	return pendingCompletions.length > 0 || rpcTurnActive;
 }
 
 async function sendSteerRpc(message: string): Promise<void> {
@@ -677,6 +696,7 @@ async function sendSteerRpc(message: string): Promise<void> {
 async function sendPromptRpc(
 	message: string,
 	onStream?: (text: string) => void,
+	onSlow?: (elapsedMs: number) => void,
 ): Promise<string> {
 	if (!rpcProcess) throw new Error("pi agent not running");
 
@@ -687,29 +707,36 @@ async function sendPromptRpc(
 		throw new Error(`Prompt rejected: ${JSON.stringify(ackResponse)}`);
 	}
 
+	rpcTurnActive = true;
 	logger.info("[gateway] Prompt ACK received, waiting for agent_end...");
 
-	// Wait for agent_end to deliver the full response
-	const timeoutMs = config.promptTimeoutMs ?? 300000;
-	const minutes = Math.round(timeoutMs / 60000);
+	const noticeMs = config.promptTimeoutMs ?? 300000;
+	const startedAt = Date.now();
 	return new Promise((resolve, reject) => {
-		const timer = setTimeout(() => {
-			const idx = pendingCompletions.findIndex((c) => c.timer === timer);
-			if (idx !== -1) pendingCompletions.splice(idx, 1);
-			reject(
-				new Error(
-					`Prompt completion timeout — no agent_end received within ${minutes} minute${minutes === 1 ? "" : "s"}`,
-				),
-			);
-		}, timeoutMs);
-
-		pendingCompletions.push({
-			resolve,
-			reject,
-			timer,
+		const completion: PendingCompletion = {
+			resolve: (text) => {
+				clearCompletionTimer(completion);
+				resolve(text);
+			},
+			reject: (err) => {
+				clearCompletionTimer(completion);
+				reject(err);
+			},
+			timer: null,
 			onStream,
+			onSlow,
 			streamedText: "",
-		});
+		};
+		if (noticeMs > 0) {
+			completion.timer = setInterval(() => {
+				const elapsed = Date.now() - startedAt;
+				logger.warn(
+					`[gateway] Prompt still running after ${Math.round(elapsed / 60000)} min; waiting for agent_end`,
+				);
+				completion.onSlow?.(elapsed);
+			}, noticeMs);
+		}
+		pendingCompletions.push(completion);
 	});
 }
 
@@ -1217,9 +1244,9 @@ const adapterCallbacks: AdapterCallbacks = {
 					rpcProcess = null;
 				}
 				// Reject any pending completions
+				rpcTurnActive = false;
 				while (pendingCompletions.length > 0) {
 					const c = pendingCompletions.shift()!;
-					clearTimeout(c.timer);
 					c.reject(new Error("Agent restarted by admin"));
 				}
 				rpcProcess = createRpcProcess();
@@ -1342,6 +1369,22 @@ const adapterCallbacks: AdapterCallbacks = {
 								}
 							}
 						: undefined,
+					adapter && sentId
+						? (elapsedMs: number) => {
+								const currentId = sentId;
+								if (!currentId) return;
+								const notice = stillWorkingNotice(elapsedMs);
+								const streamed = pendingCompletions[0]?.streamedText?.trim();
+								const body = streamed ? `${streamed}\n\n${notice}` : notice;
+								adapter
+									.editMessage(
+										message.channelId,
+										currentId,
+										body.length > 2000 ? `${body.slice(0, 1985)}…` : body,
+									)
+									.catch(() => {});
+							}
+						: undefined,
 				);
 
 				logger.info(
@@ -1393,10 +1436,29 @@ const adapterCallbacks: AdapterCallbacks = {
 			} catch (err) {
 				logger.error("[gateway] RPC error processing message:", err);
 				clearInterval(typingInterval);
+				if (adapter && isAgentAlreadyProcessingError(err)) {
+					try {
+						await sendSteerRpc(message.content);
+						const queued =
+							"↪️ 上一轮还在跑，这条已作为引导加入。结束后会按这个调整。";
+						if (sentId) {
+							await adapter.editMessage(message.channelId, sentId, queued);
+						} else {
+							await adapter.sendMessage(message.channelId, queued);
+						}
+						await adapter.setTyping(message.channelId, false);
+						return;
+					} catch (steerErr) {
+						logger.warn("[gateway] Steer fallback after already-processing failed:", steerErr);
+					}
+				}
 				if (adapter) {
 					try {
-						const errorMsg =
-							"Sorry, I encountered an error processing your message. Please try again.";
+						const detail =
+							err instanceof Error ? err.message.split("\n")[0] : String(err);
+						const errorMsg = isAgentAlreadyProcessingError(err)
+							? "上一轮还没结束，暂时接不了新消息。等它跑完，或用 /restart。"
+							: `Sorry, I encountered an error processing your message.\n${detail.slice(0, 180)}`;
 						if (sentId) {
 							await adapter.editMessage(message.channelId, sentId, errorMsg);
 						} else {

@@ -9,3 +9,13 @@ export type ChatPromptRoute = "prompt" | "steer";
 export function routeChatMessage(agentBusy: boolean): ChatPromptRoute {
 	return agentBusy ? "steer" : "prompt";
 }
+
+export function isAgentAlreadyProcessingError(error: unknown): boolean {
+	const text = error instanceof Error ? error.message : String(error);
+	return /already processing/i.test(text);
+}
+
+export function stillWorkingNotice(elapsedMs: number): string {
+	const minutes = Math.max(1, Math.round(elapsedMs / 60000));
+	return `⏳ 还在处理（已 ${minutes} 分钟）。完成后会发到这条消息里，不用重发。`;
+}
