@@ -12,6 +12,18 @@ export const DISCORD_SLASH_COMMANDS = [
 		description: "Use an isolated gateway session again",
 	},
 	{
+		name: "resume",
+		description: "Pick a recent session to continue",
+		options: [
+			{
+				name: "n",
+				description: "List number from /resume",
+				type: 4,
+				required: false,
+			},
+		],
+	},
+	{
 		name: "new",
 		description: "Start a fresh conversation, optionally in a folder",
 		options: [
@@ -56,6 +68,12 @@ export function slashInteractionToContent(data: {
 		const path = data.options?.find((option) => option.name === "path")?.value;
 		if (typeof path === "string" && path.trim()) return `/new ${path.trim()}`;
 		return "/new";
+	}
+	if (name === "resume") {
+		const n = data.options?.find((option) => option.name === "n")?.value;
+		if (typeof n === "number" && n >= 1) return `/resume ${n}`;
+		if (typeof n === "string" && /^\d+$/.test(n.trim())) return `/resume ${n.trim()}`;
+		return "/resume";
 	}
 	if (["continue", "session", "detach", "restart"].includes(name)) {
 		return `/${name}`;

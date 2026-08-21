@@ -20,6 +20,8 @@ import { DISCORD_SLASH_COMMANDS, slashInteractionToContent } from "./slash-comma
 import {
   buildDiscordInteractiveMessage,
   parseDiscordButtonCustomId,
+  truncateDiscordContent,
+  truncateDiscordLabel,
 } from "./discord-interactive.js";
 
 export interface DiscordConfig extends PlatformConfig {
@@ -282,11 +284,28 @@ export class DiscordAdapter extends BaseAdapter {
       logger.error("[Discord] Failed to acknowledge button interaction:", error);
     }
 
-    if (!parsed) {
+    if (parsed) {
+      this.callbacks?.onInteractiveResponse?.(parsed, userId);
+      return;
+    }
+    const channelId = data.channel_id;
+    if (!userId || !channelId || !customId) {
       logger.warn(`[Discord] Unknown interactive custom_id: ${customId}`);
       return;
     }
-    this.callbacks?.onInteractiveResponse?.(parsed, userId);
+    await this.emitMessage({
+      id: data.id ?? customId,
+      platform: this.platform,
+      channelId,
+      userId,
+      content: `Callback: ${customId}`,
+      timestamp: Date.now(),
+      metadata: {
+        guildId: data.guild_id,
+        isDM: !data.guild_id,
+        callback: true,
+      },
+    });
   }
 
   async sendInteractive(
@@ -318,6 +337,26 @@ export class DiscordAdapter extends BaseAdapter {
 
   async sendMessage(channelId: string, content: string): Promise<string> {
     return this.sendDiscordMessage(channelId, { content });
+  }
+
+  async sendButtons(
+    channelId: string,
+    text: string,
+    buttons: Array<Array<{ text: string; data: string }>>,
+  ): Promise<string> {
+    const components = buttons.slice(0, 5).map((row) => ({
+      type: 1 as const,
+      components: row.slice(0, 5).map((button) => ({
+        type: 2 as const,
+        style: 2,
+        label: truncateDiscordLabel(button.text),
+        custom_id: button.data.slice(0, 100),
+      })),
+    }));
+    return this.sendDiscordMessage(channelId, {
+      content: truncateDiscordContent(text),
+      components,
+    });
   }
 
   private async sendDiscordMessage(

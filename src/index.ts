@@ -68,6 +68,15 @@ import {
 	resolveSessionCwd,
 } from "./sessions/new-session.js";
 import { ensureDetachedWorkspace } from "./sessions/workspace.js";
+import {
+	buildResumeAttachedMessage,
+	formatResumeList,
+	listRecentSessions,
+	parseResumeCallback,
+	rememberResumeList,
+	resumeButtons,
+	takeResumeChoice,
+} from "./sessions/resume.js";
 import { logger } from "./logger.js";
 import {
 	GATEWAY_CONFIG_DIR,
@@ -750,13 +759,114 @@ const adapterCallbacks: AdapterCallbacks = {
 		) {
 			return;
 		}
+		const resumeCallbackIndex = parseResumeCallback(sessionCmd);
 		const sessionCommand = parseChatSessionCommand(sessionCmd);
-		if (sessionCommand) {
+		if (resumeCallbackIndex !== null || sessionCommand) {
 			const adapter = state.adapters.get(message.platform);
 			if (!rpcProcess) {
 				if (adapter) await adapter.sendMessage(message.channelId, "Agent not running.");
 				return;
 			}
+			const resumeIndex =
+				resumeCallbackIndex !== null
+					? resumeCallbackIndex
+					: sessionCommand?.name === "resume" && sessionCommand.index
+						? sessionCommand.index - 1
+						: null;
+			if (resumeCallbackIndex !== null || sessionCommand?.name === "resume") {
+				if (!isAdmin(message.platform as Platform, message.userId)) {
+					if (adapter) {
+						await adapter.sendMessage(
+							message.channelId,
+							"Only admins can resume a session.",
+						);
+					}
+					return;
+				}
+				if (resumeIndex !== null) {
+					let choice = takeResumeChoice(
+						message.platform,
+						message.channelId,
+						resumeIndex,
+					);
+					if (!choice.ok) {
+						const sessions = listRecentSessions({
+							rpcSessionDir: join(GATEWAY_CONFIG_DIR, "rpc-sessions"),
+						});
+						if (resumeIndex >= 0 && resumeIndex < sessions.length) {
+							choice = { ok: true, sessionFile: sessions[resumeIndex].sessionFile };
+						}
+					}
+					if (!choice.ok) {
+						if (adapter) await adapter.sendMessage(message.channelId, choice.error);
+						return;
+					}
+					try {
+						await switchRpcSession(choice.sessionFile);
+						setChannelBinding(
+							message.platform,
+							message.channelId,
+							choice.sessionFile,
+						);
+						const age = sessionFileAgeMs(choice.sessionFile);
+						if (adapter) {
+							await adapter.sendMessage(
+								message.channelId,
+								buildResumeAttachedMessage(
+									choice.sessionFile,
+									age !== null && age < 15_000,
+								),
+							);
+						}
+					} catch (error) {
+						logger.error("[gateway] Failed to resume session:", error);
+						if (adapter) {
+							await adapter.sendMessage(
+								message.channelId,
+								`Failed to resume: ${error instanceof Error ? error.message : String(error)}`,
+							);
+						}
+					}
+					return;
+				}
+				const active = readActiveSession();
+				const bound = getChannelBinding(message.platform, message.channelId);
+				const sessions = listRecentSessions({
+					rpcSessionDir: join(GATEWAY_CONFIG_DIR, "rpc-sessions"),
+					boundFile: bound?.sessionFile ?? null,
+					activeFile: active?.sessionFile ?? null,
+				});
+				rememberResumeList(
+					message.platform,
+					message.channelId,
+					sessions.map((session) => session.sessionFile),
+				);
+				const listText = formatResumeList(sessions, {
+					boundFile: bound?.sessionFile ?? null,
+					activeFile: active?.sessionFile ?? null,
+				});
+				if (adapter) {
+					const withButtons = adapter as {
+						sendButtons?: (
+							ch: string,
+							text: string,
+							btns: Array<Array<{ text: string; data: string }>>,
+						) => Promise<string>;
+					};
+					const buttons = resumeButtons(sessions);
+					if (withButtons.sendButtons && buttons.length > 0) {
+						await withButtons.sendButtons(
+							message.channelId,
+							listText,
+							buttons,
+						);
+					} else {
+						await adapter.sendMessage(message.channelId, listText);
+					}
+				}
+				return;
+			}
+			if (!sessionCommand) return;
 			if (sessionCommand.name === "session") {
 				const active = readActiveSession();
 				const bound = getChannelBinding(message.platform, message.channelId);

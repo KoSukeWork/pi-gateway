@@ -4,6 +4,14 @@ import { slashInteractionToContent } from "../src/adapters/slash-commands.js";
 assert.equal(slashInteractionToContent({ name: "continue" }), "/continue");
 assert.equal(slashInteractionToContent({ name: "session" }), "/session");
 assert.equal(slashInteractionToContent({ name: "detach" }), "/detach");
+assert.equal(slashInteractionToContent({ name: "resume" }), "/resume");
+assert.equal(
+	slashInteractionToContent({
+		name: "resume",
+		options: [{ name: "n", value: 2 }],
+	}),
+	"/resume 2",
+);
 assert.equal(slashInteractionToContent({ name: "new" }), "/new");
 assert.equal(
 	slashInteractionToContent({

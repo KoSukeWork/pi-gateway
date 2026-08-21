@@ -18,6 +18,7 @@ Multi-platform chat bridge for pi — connect your AI agent to Telegram, Discord
 - **Mid-run steer** — if you send another chat message while the agent is busy (including waiting on a permission button), it is queued as Pi `steer` instead of being rejected.
 - **Session identity cards** — `/continue` and `/session` show project, model, and last messages instead of only a jsonl path
 - **New conversation in a folder** — `/new <path>` (admin) starts a fresh session whose bash/read/edit cwd is that directory
+- **Resume picker** — `/resume` lists recent sessions with project and last user text; Discord/Telegram buttons pick one
 
 ## Installation
 
@@ -290,6 +291,8 @@ Then talk normally. That chat is bound to the desktop session file via RPC `swit
 | Chat command | Who | Effect |
 |---|---|---|
 | `/continue` | admin | Attach this chat to the last desktop Pi session |
+| `/resume` | admin | List recent sessions and pick one to continue |
+| `/resume <n>` | admin | Resume item N from that list (or the current recent list) |
 | `/session` | allowed users | Show project, last messages, and attached session |
 | `/detach` | allowed users | Go back to an isolated gateway session |
 | `/new` | allowed users | Start a fresh isolated conversation in the current agent folder |
@@ -297,7 +300,7 @@ Then talk normally. That chat is bound to the desktop session file via RPC `swit
 
 If the session file was written in the last 15 seconds, `/continue` warns that the desktop Pi may still be live.
 
-On Discord these are also registered as **slash commands** (`/continue`, `/session`, `/detach`, `/new`, `/model`, `/restart`). Global commands can take a few minutes to appear; DMs work after the bot shares a server with you. Re-invite the bot with the `applications.commands` scope if `/` shows nothing.
+On Discord these are also registered as **slash commands** (`/continue`, `/resume`, `/session`, `/detach`, `/new`, `/model`, `/restart`). Global commands can take a few minutes to appear; DMs work after the bot shares a server with you. Re-invite the bot with the `applications.commands` scope if `/` shows nothing.
 
 ## Commands
 
