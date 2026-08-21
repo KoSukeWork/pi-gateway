@@ -22,6 +22,7 @@ import {
 	type GatewayHealthConfig,
 } from "./status.js";
 import { resolveDaemonInvocation } from "./runtime-entry.js";
+import { ensureDetachedWorkspace } from "./sessions/workspace.js";
 
 const PID_FILE = join(homedir(), ".pi", "gateway", "gateway.pid");
 
@@ -78,6 +79,7 @@ Usage:
   pi-gateway --help        Show this help
 
 The daemon runs independently of pi. Once started, it:
+  - Uses ~/pi-gateway-workspace as the working directory
   - Listens for messages on configured platforms (Telegram, Discord, etc.)
   - Spawns its own pi --mode rpc for AI processing
   - Logs to ~/.pi/gateway/gateway.log
@@ -109,11 +111,13 @@ switch (cmd) {
 			process.exit(1);
 		}
 
-		console.log("Starting gateway daemon...");
+		const workspace = ensureDetachedWorkspace();
+		console.log(`Starting gateway daemon in ${workspace}...`);
 		const daemon = resolveDaemonInvocation(import.meta.url);
 		const child = spawn(daemon.command, daemon.args, {
 			detached: true,
 			stdio: "ignore",
+			cwd: workspace,
 			env: process.env,
 		});
 		child.unref();

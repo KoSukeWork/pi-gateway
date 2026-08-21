@@ -11,12 +11,13 @@ Multi-platform chat bridge for pi — connect your AI agent to Telegram, Discord
 - **Per-chat sessions** — isolated conversations with configurable reset policies (daily / idle)
 - **Background tasks** — spawn async work from chats, results delivered when ready
 - **Allowlist security** — DB-based and config-file pre-approved UIDs, admin roles, tool access policies
-- **Detached daemon mode** — `/gateway start -d` or `pi-gateway start -d` keeps the gateway alive after pi closes
+- **Detached daemon mode** — `/gateway start -d` or `pi-gateway start` keeps the gateway alive after pi closes, in `~/pi-gateway-workspace`. Inline `/gateway start` keeps the current TUI working directory.
 - **HTTP + WebSocket API** — connect external clients, send prompts, receive streaming responses
 - **pi-native** — runs as a pi extension with `/gateway` slash commands and registered tools
 - **Interactive prompts** — `ctx.ui.select()` / `confirm()` / `input()` (including permission-plugin asks) are forwarded to chat. Telegram and Discord use buttons; you can also reply with the number. Unanswered dialogs cancel after 2 minutes so the RPC agent cannot hang.
 - **Mid-run steer** — if you send another chat message while the agent is busy (including waiting on a permission button), it is queued as Pi `steer` instead of being rejected.
 - **Session identity cards** — `/continue` and `/session` show project, model, and last messages instead of only a jsonl path
+- **New conversation in a folder** — `/new <path>` (admin) starts a fresh session whose bash/read/edit cwd is that directory
 
 ## Installation
 
@@ -274,7 +275,7 @@ When `requirePairing` is enabled and a user is not in the allowlist:
 The gateway still cannot share the live TUI process. It *can* reopen the same session file after you leave the desktop window.
 
 1. Keep this package loaded in the desktop Pi so it can publish `~/.pi/gateway/active-session.json`.
-2. Start the gateway (`/gateway start` or `-d`).
+2. Start the gateway. Inline `/gateway start` inherits the current TUI folder. `/gateway start -d` (and `pi-gateway start`) uses `~/pi-gateway-workspace`.
 3. **Close or leave the desktop session idle** so two processes do not write the same `.jsonl`.
 4. In Telegram/Discord (admin only), send:
 
@@ -291,7 +292,8 @@ Then talk normally. That chat is bound to the desktop session file via RPC `swit
 | `/continue` | admin | Attach this chat to the last desktop Pi session |
 | `/session` | allowed users | Show project, last messages, and attached session |
 | `/detach` | allowed users | Go back to an isolated gateway session |
-| `/new` | allowed users | Start a fresh isolated conversation |
+| `/new` | allowed users | Start a fresh isolated conversation in the current agent folder |
+| `/new <path>` | admin | Start a fresh conversation in that working directory |
 
 If the session file was written in the last 15 seconds, `/continue` warns that the desktop Pi may still be live.
 

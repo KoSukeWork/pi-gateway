@@ -13,7 +13,15 @@ export const DISCORD_SLASH_COMMANDS = [
 	},
 	{
 		name: "new",
-		description: "Start a fresh isolated conversation",
+		description: "Start a fresh conversation, optionally in a folder",
+		options: [
+			{
+				name: "path",
+				description: "Working directory for the new session",
+				type: 3,
+				required: false,
+			},
+		],
 	},
 	{
 		name: "model",
@@ -44,7 +52,12 @@ export function slashInteractionToContent(data: {
 		if (typeof id === "string" && id.trim()) return `/model ${id.trim()}`;
 		return "/model";
 	}
-	if (["continue", "session", "detach", "new", "restart"].includes(name)) {
+	if (name === "new") {
+		const path = data.options?.find((option) => option.name === "path")?.value;
+		if (typeof path === "string" && path.trim()) return `/new ${path.trim()}`;
+		return "/new";
+	}
+	if (["continue", "session", "detach", "restart"].includes(name)) {
 		return `/${name}`;
 	}
 	return null;

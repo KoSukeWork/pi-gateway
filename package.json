@@ -1,6 +1,6 @@
 {
   "name": "@gamalan/pi-gateway",
-  "version": "1.14.0",
+  "version": "1.15.0",
   "description": "Multi-platform chat bridge for pi \u2014 connect your AI agent to Telegram, Discord, Slack, and more. Real-time streaming, per-chat sessions, and role-based access control.",
   "author": "0xKobold <original>; forked by gamalan",
   "license": "MIT",
@@ -37,7 +37,7 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
-    "test": "npx tsx tests/index.ts && npx tsx tests/slash-commands.test.ts && npx tsx tests/discord-interactive.test.ts && npx tsx tests/interactive-bridge.test.ts && npx tsx tests/prompt-routing.test.ts && npx tsx tests/active-session.test.ts && npx tsx tests/session-preview.test.ts",
+    "test": "npx tsx tests/index.ts && npx tsx tests/slash-commands.test.ts && npx tsx tests/discord-interactive.test.ts && npx tsx tests/interactive-bridge.test.ts && npx tsx tests/prompt-routing.test.ts && npx tsx tests/active-session.test.ts && npx tsx tests/session-preview.test.ts && npx tsx tests/workspace.test.ts && npx tsx tests/new-session.test.ts",
     "demo": "npx tsx tests/demo-server.ts",
     "client": "npx tsx tests/client-demo.ts",
     "prepublishOnly": "rm -rf dist && tsc"

@@ -61,6 +61,13 @@ import {
 	buildContinueMessage,
 	buildSessionStatusMessage,
 } from "./sessions/session-preview.js";
+import { parseChatSessionCommand } from "./sessions/chat-commands.js";
+import {
+	buildNewSessionMessage,
+	createProjectSessionFile,
+	resolveSessionCwd,
+} from "./sessions/new-session.js";
+import { ensureDetachedWorkspace } from "./sessions/workspace.js";
 import { logger } from "./logger.js";
 import {
 	GATEWAY_CONFIG_DIR,
@@ -418,6 +425,7 @@ function createRpcProcess(): any {
 	);
 	const proc = spawn(invocation.command, invocation.args, {
 		stdio: ["pipe", "pipe", "pipe"],
+		cwd: process.cwd(),
 		env: {
 			...process.env,
 			OLLAMA_HOST: process.env.OLLAMA_HOST || "localhost:11434",
@@ -742,14 +750,14 @@ const adapterCallbacks: AdapterCallbacks = {
 		) {
 			return;
 		}
-		if (/^\/(continue|session|detach|new)$/i.test(sessionCmd)) {
+		const sessionCommand = parseChatSessionCommand(sessionCmd);
+		if (sessionCommand) {
 			const adapter = state.adapters.get(message.platform);
 			if (!rpcProcess) {
 				if (adapter) await adapter.sendMessage(message.channelId, "Agent not running.");
 				return;
 			}
-			const cmd = sessionCmd.slice(1).toLowerCase();
-			if (cmd === "session") {
+			if (sessionCommand.name === "session") {
 				const active = readActiveSession();
 				const bound = getChannelBinding(message.platform, message.channelId);
 				if (adapter) {
@@ -763,7 +771,43 @@ const adapterCallbacks: AdapterCallbacks = {
 				}
 				return;
 			}
-			if (cmd === "detach" || cmd === "new") {
+			if (sessionCommand.name === "new" && sessionCommand.path) {
+				if (!isAdmin(message.platform as Platform, message.userId)) {
+					if (adapter) {
+						await adapter.sendMessage(
+							message.channelId,
+							"Only admins can start a conversation in another folder.",
+						);
+					}
+					return;
+				}
+				const resolved = resolveSessionCwd(sessionCommand.path);
+				if (!resolved.ok) {
+					if (adapter) await adapter.sendMessage(message.channelId, resolved.error);
+					return;
+				}
+				try {
+					const sessionFile = createProjectSessionFile(resolved.cwd);
+					await switchRpcSession(sessionFile);
+					setChannelBinding(message.platform, message.channelId, sessionFile);
+					if (adapter) {
+						await adapter.sendMessage(
+							message.channelId,
+							buildNewSessionMessage({ sessionFile, cwd: resolved.cwd }),
+						);
+					}
+				} catch (error) {
+					logger.error("[gateway] Failed to start a session in a new folder:", error);
+					if (adapter) {
+						await adapter.sendMessage(
+							message.channelId,
+							`Failed to start: ${error instanceof Error ? error.message : String(error)}`,
+						);
+					}
+				}
+				return;
+			}
+			if (sessionCommand.name === "detach" || sessionCommand.name === "new") {
 				clearChannelBinding(message.platform, message.channelId);
 				try {
 					await resetRpcSession();
@@ -773,7 +817,7 @@ const adapterCallbacks: AdapterCallbacks = {
 				if (adapter) {
 					await adapter.sendMessage(
 						message.channelId,
-						cmd === "new"
+						sessionCommand.name === "new"
 							? "Started a new isolated conversation."
 							: "Detached. This chat is back on an isolated gateway session.",
 					);
@@ -1694,9 +1738,11 @@ export default function (pi: ExtensionAPI) {
 
 						// Spawn detached daemon from compiled JS or TypeScript source.
 						const daemon = resolveDaemonInvocation(import.meta.url);
+						const workspace = ensureDetachedWorkspace();
 						const child = spawn(daemon.command, daemon.args, {
 							detached: true,
 							stdio: "ignore",
+							cwd: workspace,
 							env: process.env,
 						});
 						child.unref();
@@ -1721,6 +1767,7 @@ export default function (pi: ExtensionAPI) {
 
 						ctx.ui.notify(
 							`🔌 Gateway daemon ${startedHealth.running ? "started" : "is initializing"} (PID ${child.pid}).\n\n` +
+								`Working directory: ${workspace}\n` +
 								"It will keep running after pi closes.\n" +
 								"Use /gateway status to check, /gateway stop to kill.",
 							"info",
@@ -1742,6 +1789,7 @@ export default function (pi: ExtensionAPI) {
 
 					ctx.ui.notify(
 						`✅ Gateway started on http://${config.host}:${port}\n\n` +
+							`Working directory: ${process.cwd()}\n` +
 							`Platforms: ${state.adapters.size > 0 ? Array.from(state.adapters.keys()).join(", ") : "none"}\n` +
 							`Sessions: Idle reset every ${config.sessions.idleMinutes} min`,
 						"info",
@@ -2704,6 +2752,9 @@ async function detachAndRun(): Promise<void> {
 
 	logger.info(`[pi-gateway] Daemon starting (PID ${process.pid})`);
 	try {
+		const workspace = ensureDetachedWorkspace();
+		process.chdir(workspace);
+		logger.info(`[pi-gateway] Daemon working directory: ${workspace}`);
 		config = loadConfig();
 		state = {
 			running: false,
