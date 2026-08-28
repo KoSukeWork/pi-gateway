@@ -1,5 +1,24 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
+const LOAD_RETRY_DELAYS_MS = [0, 250, 750] as const;
+
+function delay(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function loadWithRetry<T>(load: () => Promise<T>): Promise<T> {
+	let lastError: unknown;
+	for (const delayMs of LOAD_RETRY_DELAYS_MS) {
+		if (delayMs > 0) await delay(delayMs);
+		try {
+			return await load();
+		} catch (error) {
+			lastError = error;
+		}
+	}
+	throw lastError;
+}
+
 const REPLAY_EVENTS = ["session_start", "resources_discover"] as const;
 
 const BLOCKING_EVENTS = [
@@ -115,7 +134,7 @@ export function installDeferred(
 
 	const ensure = () => {
 		if (!ready) {
-			ready = load()
+			const attempt = loadWithRetry(load)
 				.then((mod) => {
 					if (typeof mod.default !== "function") {
 						throw new Error("Extension runtime does not export a factory");
@@ -126,7 +145,9 @@ export function installDeferred(
 					tryRefreshAutocomplete(pi);
 					return result;
 				});
-			void ready.catch((error) => {
+			ready = attempt;
+			void attempt.catch((error) => {
+				if (ready === attempt) ready = undefined;
 				const message = error instanceof Error ? error.stack ?? error.message : String(error);
 				console.error(`[pi-lazy-extension] deferred install failed: ${message}`);
 			});
@@ -140,8 +161,8 @@ export function installDeferred(
 			getArgumentCompletions: (prefix: string) => {
 				void ensure();
 				const real = realCompletions.get(command.name);
-				if (real) return real(prefix);
-				return filterStaticCompletions(command.completions, prefix);
+				if (real) return real(prefix) ?? null;
+				return filterStaticCompletions(command.completions, prefix) ?? null;
 			},
 			handler: async (args, ctx) => {
 				await ensure();
@@ -149,7 +170,7 @@ export function installDeferred(
 				if (!handler) {
 					throw new Error(`/${command.name} failed to load`);
 				}
-				return handler(args, ctx);
+				await handler(args, ctx);
 			},
 		});
 	}
