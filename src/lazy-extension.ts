@@ -6,13 +6,14 @@ function delay(ms: number): Promise<void> {
 	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function loadWithRetry<T>(load: () => Promise<T>): Promise<T> {
+async function loadWithRetry<T>(load: () => Promise<T>, onError?: (error: unknown) => void): Promise<T> {
 	let lastError: unknown;
 	for (const delayMs of LOAD_RETRY_DELAYS_MS) {
 		if (delayMs > 0) await delay(delayMs);
 		try {
 			return await load();
 		} catch (error) {
+			onError?.(error);
 			lastError = error;
 		}
 	}
@@ -134,11 +135,21 @@ export function installDeferred(
 
 	const ensure = () => {
 		if (!ready) {
-			const attempt = loadWithRetry(load)
+			let firstLoadError: string | undefined;
+			let factoryStarted = false;
+			const attempt = loadWithRetry(load, (error) => {
+				firstLoadError ??= error instanceof Error ? error.message : String(error);
+			})
 				.then((mod) => {
 					if (typeof mod.default !== "function") {
-						throw new Error("Extension runtime does not export a factory");
+						const cause = firstLoadError
+							? `; the first load attempt failed with: ${firstLoadError}`
+							: "";
+						throw new Error(
+							`Extension runtime does not export a factory (default is ${typeof mod.default})${cause}`,
+						);
 					}
+					factoryStarted = true;
 					return mod.default(runtimePi);
 				})
 				.then((result) => {
@@ -147,7 +158,7 @@ export function installDeferred(
 				});
 			ready = attempt;
 			void attempt.catch((error) => {
-				if (ready === attempt) ready = undefined;
+				if (ready === attempt && !factoryStarted) ready = undefined;
 				const message = error instanceof Error ? error.stack ?? error.message : String(error);
 				console.error(`[pi-lazy-extension] deferred install failed: ${message}`);
 			});
