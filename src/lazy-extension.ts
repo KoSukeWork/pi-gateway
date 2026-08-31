@@ -99,7 +99,7 @@ function wrapRuntimePi(
 	pending: Map<string, { event: unknown; ctx: unknown }>,
 	realCommands: Map<string, CommandHandler>,
 	realCompletions: Map<string, CompletionsFn>,
-	replayQueue: Array<{ event: string; run: () => unknown }>,
+	replayHandlers: Map<string, Array<(event: unknown, ctx: unknown) => unknown>>,
 	commitQueue: Array<() => void>,
 ): ExtensionAPI {
 	const origOn = pi.on.bind(pi);
@@ -109,9 +109,10 @@ function wrapRuntimePi(
 			if (prop === "on") {
 				return (event: string, handler: (event: unknown, ctx: unknown) => unknown) => {
 					commitQueue.push(() => origOn(event as never, handler as never));
-					const saved = pending.get(event);
-					if (!saved) return;
-					replayQueue.push({ event, run: () => handler(saved.event, saved.ctx) });
+					if (!(REPLAY_EVENTS as readonly string[]).includes(event)) return;
+					const handlers = replayHandlers.get(event) ?? [];
+					handlers.push(handler);
+					replayHandlers.set(event, handlers);
 				};
 			}
 			if (prop === "registerCommand") {
@@ -123,11 +124,15 @@ function wrapRuntimePi(
 						getArgumentCompletions?: CompletionsFn;
 					},
 				) => {
-					realCommands.set(name, options.handler);
-					if (typeof options.getArgumentCompletions === "function") {
-						realCompletions.set(name, options.getArgumentCompletions);
-					}
-					commitQueue.push(() => origRegisterCommand(name, options as never));
+					commitQueue.push(() => {
+						origRegisterCommand(name, options as never);
+						realCommands.set(name, options.handler);
+						if (typeof options.getArgumentCompletions === "function") {
+							realCompletions.set(name, options.getArgumentCompletions);
+						} else {
+							realCompletions.delete(name);
+						}
+					});
 				};
 			}
 			const value = Reflect.get(target, prop, receiver);
@@ -144,9 +149,9 @@ export function installDeferred(
 	const pending = new Map<string, { event: unknown; ctx: unknown }>();
 	const realCommands = new Map<string, CommandHandler>();
 	const realCompletions = new Map<string, CompletionsFn>();
-	const replayQueue: Array<{ event: string; run: () => unknown }> = [];
+	const replayHandlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
 	const commitQueue: Array<() => void> = [];
-	const runtimePi = wrapRuntimePi(pi, pending, realCommands, realCompletions, replayQueue, commitQueue);
+	const runtimePi = wrapRuntimePi(pi, pending, realCommands, realCompletions, replayHandlers, commitQueue);
 	let ready: Promise<unknown> | undefined;
 	let warmupTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -180,14 +185,18 @@ export function installDeferred(
 					for (const commit of commitQueue) {
 						commit();
 					}
-					for (const replay of replayQueue) {
-						try {
-							await replay.run();
-						} catch (error) {
-							// Reported here rather than through Pi's emitError pipeline: the deferred
-							// loader has no runner handle, so hosts observe this on stderr only.
-							const message = error instanceof Error ? error.stack ?? error.message : String(error);
-							console.error(`[pi-lazy-extension] replay ${replay.event} failed: ${message}`);
+					for (const [event, handlers] of replayHandlers) {
+						const saved = pending.get(event);
+						if (!saved) continue;
+						for (const handler of handlers) {
+							try {
+								await handler(saved.event, saved.ctx);
+							} catch (error) {
+								// Reported here rather than through Pi's emitError pipeline: the deferred
+								// loader has no runner handle, so hosts observe this on stderr only.
+								const message = error instanceof Error ? error.stack ?? error.message : String(error);
+								console.error(`[pi-lazy-extension] replay ${event} failed: ${message}`);
+							}
 						}
 					}
 					tryRefreshAutocomplete(pi);

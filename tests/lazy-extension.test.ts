@@ -244,6 +244,110 @@ register("contains async replay rejections without failing the install", async (
 	);
 });
 
+register("replays the latest session_start received while an async factory is installing", { timeout: 30000 }, async () => {
+	const { pi, emit } = createFakePi();
+	const received: string[] = [];
+	let releaseFactory!: () => void;
+	const gate = new Promise<void>((resolve) => {
+		releaseFactory = resolve;
+	});
+	const load = (async () => ({
+		default: async (runtime: unknown) => {
+			(runtime as DeferredPi).on("session_start", (event) => {
+				received.push(String((event as { name?: string }).name));
+			});
+			await gate;
+		},
+	})) as unknown as DeferredLoad;
+	installDeferred(pi, load);
+	await emit("session_start", { name: "A" });
+	const installing = emit("tool_call");
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	await emit("session_start", { name: "B" });
+	releaseFactory();
+	await installing;
+	assert.deepStrictEqual(received, ["B"], "stale session A must not be replayed after newer session B");
+});
+
+register("replays a session_start that first arrives while the factory is installing", { timeout: 30000 }, async () => {
+	const { pi, emit } = createFakePi();
+	const received: string[] = [];
+	let releaseFactory!: () => void;
+	const gate = new Promise<void>((resolve) => {
+		releaseFactory = resolve;
+	});
+	const load = (async () => ({
+		default: async (runtime: unknown) => {
+			(runtime as DeferredPi).on("session_start", (event) => {
+				received.push(String((event as { name?: string }).name));
+			});
+			await gate;
+		},
+	})) as unknown as DeferredLoad;
+	installDeferred(pi, load);
+	const installing = emit("tool_call");
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	await emit("session_start", { name: "B" });
+	releaseFactory();
+	await installing;
+	assert.deepStrictEqual(received, ["B"], "handler registered with empty pending must still receive the later event");
+});
+
+register("does not expose deferred command completions when the factory fails", { timeout: 30000 }, async () => {
+	const { pi, commands, emit } = createFakePi();
+	let completionCalls = 0;
+	const load: DeferredLoad = async () => ({
+		default: (runtime: unknown) => {
+			(runtime as DeferredPi).registerCommand("demo", {
+				handler: () => undefined,
+				getArgumentCompletions: () => {
+					completionCalls += 1;
+					return [{ value: "real", label: "real" }];
+				},
+			} as never);
+			throw new Error("factory exploded after registering");
+		},
+	});
+	installDeferred(pi, load, {
+		commands: [{ name: "demo", description: "demo command", completions: ["static"] }],
+	});
+	await captureRejection(emit("tool_call"));
+	const stub = commands.get("demo") as { getArgumentCompletions?: (prefix: string) => unknown };
+	const result = stub.getArgumentCompletions?.("");
+	assert.strictEqual(completionCalls, 0, "completions of a failed factory must stay unexposed");
+	assert.deepStrictEqual(result, [{ value: "static", label: "static" }]);
+});
+
+register("removes stale completions when a command is replaced without completions", { timeout: 30000 }, async () => {
+	const { pi, commands, emit } = createFakePi();
+	let firstCalls = 0;
+	const load: DeferredLoad = async () => ({
+		default: (runtime: unknown) => {
+			const rt = runtime as DeferredPi;
+			rt.registerCommand("demo", {
+				handler: () => undefined,
+				getArgumentCompletions: () => {
+					firstCalls += 1;
+					return [{ value: "first", label: "first" }];
+				},
+			} as never);
+			rt.registerCommand("demo", { handler: () => undefined } as never);
+		},
+	});
+	installDeferred(pi, load, {
+		commands: [{ name: "demo", description: "demo command", completions: ["static"] }],
+	});
+	await emit("tool_call");
+	const stub = commands.get("demo") as { getArgumentCompletions?: (prefix: string) => unknown };
+	const result = stub.getArgumentCompletions?.("");
+	assert.strictEqual(firstCalls, 0, "stale completion must stop being called after replacement");
+	assert.strictEqual(
+		result,
+		undefined,
+		"replacement without completions must not expose any completion",
+	);
+});
+
 register("cancelled warmup does not load the factory after session_shutdown", async () => {
 	const { pi, emit } = createFakePi();
 	let loadCalls = 0;
