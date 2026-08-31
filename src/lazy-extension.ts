@@ -20,28 +20,41 @@ async function loadWithRetry<T>(load: () => Promise<T>, onError?: (error: unknow
 	throw lastError;
 }
 
-const REPLAY_EVENTS = ["session_start", "resources_discover"] as const;
+export const REPLAY_EVENTS = ["session_start"] as const;
 
-const BLOCKING_EVENTS = [
+export const BLOCKING_EVENTS = [
+	"resources_discover",
 	"session_shutdown",
+	"session_info_changed",
 	"session_before_switch",
 	"session_before_fork",
+	"session_before_tree",
 	"session_before_compact",
 	"session_compact",
+	"session_compact_failed",
 	"session_tree",
+	"project_trust",
 	"before_agent_start",
 	"before_provider_request",
 	"before_provider_headers",
-	"input",
-	"tool_call",
-	"tool_result",
-	"tool_execution_end",
+	"after_provider_response",
 	"agent_start",
 	"agent_end",
 	"agent_settled",
-	"message_start",
-	"message_end",
+	"ui_prompt_start",
+	"ui_prompt_end",
+	"turn_start",
 	"turn_end",
+	"message_start",
+	"message_update",
+	"message_end",
+	"input",
+	"user_bash",
+	"tool_call",
+	"tool_execution_start",
+	"tool_execution_update",
+	"tool_execution_end",
+	"tool_result",
 	"model_select",
 	"thinking_level_select",
 	"context",
@@ -82,6 +95,7 @@ function wrapRuntimePi(
 	pending: Map<string, { event: unknown; ctx: unknown }>,
 	realCommands: Map<string, CommandHandler>,
 	realCompletions: Map<string, CompletionsFn>,
+	replayQueue: Array<{ event: string; run: () => unknown }>,
 ): ExtensionAPI {
 	const origOn = pi.on.bind(pi);
 	const origRegisterCommand = pi.registerCommand.bind(pi);
@@ -92,12 +106,7 @@ function wrapRuntimePi(
 					origOn(event as never, handler as never);
 					const saved = pending.get(event);
 					if (!saved) return;
-					try {
-						void handler(saved.event, saved.ctx);
-					} catch (error) {
-						const message = error instanceof Error ? error.stack ?? error.message : String(error);
-						console.error(`[pi-lazy-extension] replay ${event} failed: ${message}`);
-					}
+					replayQueue.push({ event, run: () => handler(saved.event, saved.ctx) });
 				};
 			}
 			if (prop === "registerCommand") {
@@ -130,8 +139,10 @@ export function installDeferred(
 	const pending = new Map<string, { event: unknown; ctx: unknown }>();
 	const realCommands = new Map<string, CommandHandler>();
 	const realCompletions = new Map<string, CompletionsFn>();
-	const runtimePi = wrapRuntimePi(pi, pending, realCommands, realCompletions);
+	const replayQueue: Array<{ event: string; run: () => unknown }> = [];
+	const runtimePi = wrapRuntimePi(pi, pending, realCommands, realCompletions, replayQueue);
 	let ready: Promise<unknown> | undefined;
+	let warmupTimer: ReturnType<typeof setTimeout> | undefined;
 
 	const ensure = () => {
 		if (!ready) {
@@ -140,7 +151,7 @@ export function installDeferred(
 			const attempt = loadWithRetry(load, (error) => {
 				firstLoadError ??= error instanceof Error ? error.message : String(error);
 			})
-				.then((mod) => {
+				.then(async (mod) => {
 					if (typeof mod.default !== "function") {
 						const cause = firstLoadError
 							? `; the first load attempt failed with: ${firstLoadError}`
@@ -150,9 +161,24 @@ export function installDeferred(
 						);
 					}
 					factoryStarted = true;
-					return mod.default(runtimePi);
-				})
-				.then((result) => {
+					let result: unknown;
+					try {
+						result = await mod.default(runtimePi);
+					} catch (error) {
+						if (firstLoadError !== undefined) {
+							const message = error instanceof Error ? error.message : String(error);
+							throw new Error(`${message}; the first load attempt failed with: ${firstLoadError}`);
+						}
+						throw error;
+					}
+					for (const replay of replayQueue) {
+						try {
+							await replay.run();
+						} catch (error) {
+							const message = error instanceof Error ? error.stack ?? error.message : String(error);
+							console.error(`[pi-lazy-extension] replay ${replay.event} failed: ${message}`);
+						}
+					}
 					tryRefreshAutocomplete(pi);
 					return result;
 				});
@@ -192,7 +218,9 @@ export function installDeferred(
 		on(event, (e, ctx) => {
 			pending.set(event, { event: e, ctx });
 			if (event === "session_start") {
-				setTimeout(() => {
+				clearTimeout(warmupTimer);
+				warmupTimer = setTimeout(() => {
+					warmupTimer = undefined;
 					void ensure();
 				}, 250);
 			}
@@ -201,7 +229,11 @@ export function installDeferred(
 
 	for (const event of BLOCKING_EVENTS) {
 		on(event, async () => {
-			if (event === "session_shutdown" && !ready) return;
+			if (event === "session_shutdown") {
+				clearTimeout(warmupTimer);
+				warmupTimer = undefined;
+				if (!ready) return;
+			}
 			await ensure();
 		});
 	}
