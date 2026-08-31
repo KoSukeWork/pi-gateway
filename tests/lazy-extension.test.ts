@@ -348,6 +348,42 @@ register("removes stale completions when a command is replaced without completio
 	);
 });
 
+register("queues a newer session_start that arrives while replay is awaiting", { timeout: 30000 }, async () => {
+	const { pi, emit } = createFakePi();
+	const first: string[] = [];
+	const second: string[] = [];
+	let releaseFirst!: () => void;
+	const gate = new Promise<void>((resolve) => {
+		releaseFirst = resolve;
+	});
+	const load = (async () => ({
+		default: async (runtime: unknown) => {
+			const rt = runtime as DeferredPi;
+			rt.on("session_start", async (event) => {
+				first.push(String((event as { name?: string }).name));
+				if ((event as { name?: string }).name === "B") {
+					await gate;
+				}
+			});
+			rt.on("session_start", (event) => {
+				second.push(String((event as { name?: string }).name));
+			});
+		},
+	})) as unknown as DeferredLoad;
+	installDeferred(pi, load);
+	await emit("session_start", { name: "B" });
+	const installing = emit("tool_call");
+	await new Promise((resolve) => setTimeout(resolve, 20));
+	await emit("session_start", { name: "C" });
+	assert.ok(
+		!first.includes("C") && !second.includes("C"),
+		`C must queue behind the replay instead of racing live handlers: ${JSON.stringify({ first, second })}`,
+	);
+	releaseFirst();
+	await installing;
+	assert.deepStrictEqual(first, ["B", "C"]);
+	assert.deepStrictEqual(second, ["B", "C"]);
+});
 register("cancelled warmup does not load the factory after session_shutdown", async () => {
 	const { pi, emit } = createFakePi();
 	let loadCalls = 0;

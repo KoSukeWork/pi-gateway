@@ -101,15 +101,20 @@ function wrapRuntimePi(
 	realCompletions: Map<string, CompletionsFn>,
 	replayHandlers: Map<string, Array<(event: unknown, ctx: unknown) => unknown>>,
 	commitQueue: Array<() => void>,
+	origOn: (event: string, handler: (event: unknown, ctx: unknown) => unknown) => void,
 ): ExtensionAPI {
-	const origOn = pi.on.bind(pi);
 	const origRegisterCommand = pi.registerCommand.bind(pi);
 	return new Proxy(pi, {
 		get(target, prop, receiver) {
 			if (prop === "on") {
 				return (event: string, handler: (event: unknown, ctx: unknown) => unknown) => {
-					commitQueue.push(() => origOn(event as never, handler as never));
-					if (!(REPLAY_EVENTS as readonly string[]).includes(event)) return;
+					if (!(REPLAY_EVENTS as readonly string[]).includes(event)) {
+						commitQueue.push(() => origOn(event as never, handler as never));
+						return;
+					}
+					// Replay handlers stay uncommitted until the pending event has been
+					// drained, so an event arriving mid-replay queues up behind the replay
+					// delivery instead of racing it through the already-live handler.
 					const handlers = replayHandlers.get(event) ?? [];
 					handlers.push(handler);
 					replayHandlers.set(event, handlers);
@@ -151,7 +156,8 @@ export function installDeferred(
 	const realCompletions = new Map<string, CompletionsFn>();
 	const replayHandlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
 	const commitQueue: Array<() => void> = [];
-	const runtimePi = wrapRuntimePi(pi, pending, realCommands, realCompletions, replayHandlers, commitQueue);
+	const origOn = pi.on.bind(pi) as (event: string, handler: (event: unknown, ctx: unknown) => unknown) => void;
+	const runtimePi = wrapRuntimePi(pi, pending, realCommands, realCompletions, replayHandlers, commitQueue, origOn);
 	let ready: Promise<unknown> | undefined;
 	let warmupTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -186,17 +192,28 @@ export function installDeferred(
 						commit();
 					}
 					for (const [event, handlers] of replayHandlers) {
-						const saved = pending.get(event);
-						if (!saved) continue;
-						for (const handler of handlers) {
-							try {
-								await handler(saved.event, saved.ctx);
-							} catch (error) {
-								// Reported here rather than through Pi's emitError pipeline: the deferred
-								// loader has no runner handle, so hosts observe this on stderr only.
-								const message = error instanceof Error ? error.stack ?? error.message : String(error);
-								console.error(`[pi-lazy-extension] replay ${event} failed: ${message}`);
+						let delivered: { event: unknown; ctx: unknown } | undefined;
+						while (true) {
+							const latest = pending.get(event);
+							if (!latest || latest === delivered) {
+								break;
 							}
+							delivered = latest;
+							for (const handler of handlers) {
+								try {
+									await handler(latest.event, latest.ctx);
+								} catch (error) {
+									// Reported here rather than through Pi's emitError pipeline: the deferred
+									// loader has no runner handle, so hosts observe this on stderr only.
+									const message = error instanceof Error ? error.stack ?? error.message : String(error);
+									console.error(`[pi-lazy-extension] replay ${event} failed: ${message}`);
+								}
+							}
+						}
+						// No await between the final drain check and these registrations, so no
+						// external event can slip in ahead of the handlers going live.
+						for (const handler of handlers) {
+							origOn(event as never, handler as never);
 						}
 					}
 					tryRefreshAutocomplete(pi);
