@@ -1,19 +1,20 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { ExtensionEvent } from "@earendil-works/pi-coding-agent";
-import { BLOCKING_EVENTS, REPLAY_EVENTS, installDeferred } from "../src/lazy-extension.ts";
+import { BLOCKING_EVENTS, REPLAY_EVENTS, STARTUP_EVENTS, installDeferred } from "../src/lazy-extension.ts";
 
 const register = test;
 
 type InstallArgs = Parameters<typeof installDeferred>;
+type InstallOptions = InstallArgs[2];
 type DeferredPi = InstallArgs[0];
 type DeferredLoad = InstallArgs[1];
 type Handler = (event: unknown, ctx: unknown) => unknown;
 
-// Faithful mini-model of Pi 0.84.3 event dispatch: handlers live in arrays and
-// the dispatcher iterates the live array, so handlers registered during a
-// dispatch are reached by that same dispatch (this is how the deferred loader
-// delivers events to the real factory).
+// Faithful mini-model of Pi event dispatch: handlers live in arrays and the
+// dispatcher iterates the live array, so handlers registered during a dispatch
+// are reached by that same dispatch (this is how the deferred loader delivers
+// startup and blocking events to the real factory).
 function createFakePi() {
 	const handlers = new Map<string, Handler[]>();
 	const commands = new Map<string, unknown>();
@@ -21,15 +22,12 @@ function createFakePi() {
 	let activeTools: unknown;
 	// Anything-proxy: unknown ExtensionAPI members resolve to a callable that
 	// tolerates arbitrary member access and calls, so real factories that touch
-	// host-provided helpers (eventemitter-like objects, ui helpers, ...) do not
-	// crash the harness on shapes the loader contract does not care about.
-	// eslint-disable-next-line
+	// host-provided helpers do not crash the harness. The loader binds every
+	// function-valued member before handing it to the factory, so bind/call/
+	// apply must hand back a plain callable instead of a broken bound function.
 	const anything: unknown = new Proxy(function anything() {}, {
 		get(_target, prop) {
 			if (prop === "then") return undefined;
-			// The loader binds every function-valued member before handing it to
-			// the factory; Function.prototype.bind on this proxy must not produce
-			// a broken bound function, so hand back a callable directly.
 			if (prop === "bind" || prop === "call" || prop === "apply") {
 				return () => anything;
 			}
@@ -58,8 +56,9 @@ function createFakePi() {
 	const pi = new Proxy(base, {
 		get(target, prop) {
 			if (typeof prop !== "string") return undefined;
-			if (prop === "then") return undefined;
 			if (prop in target) return target[prop];
+			// never expose a thenable: the loader awaits the factory result
+			if (prop === "then") return undefined;
 			return anything;
 		},
 	}) as unknown as DeferredPi;
@@ -88,7 +87,11 @@ async function captureRejection(pending: Promise<unknown>): Promise<Error> {
 	throw new Error("expected the deferred attempt to reject");
 }
 
-const PI_0_84_3_EVENTS = [
+// Baseline: Pi 0.84.4 (36 events). Stock Pi 0.84.3 dispatches 34 of these;
+// ui_prompt_start/ui_prompt_end only exist from 0.84.4, so their stubs are
+// inert there. resources_discover and project_trust are startup events and are
+// registered only when the bootstrap declares them.
+const PI_0_84_4_EVENTS = [
 	"project_trust",
 	"resources_discover",
 	"session_start",
@@ -128,30 +131,56 @@ const PI_0_84_3_EVENTS = [
 ];
 
 // Fails to compile when the installed Pi version adds extension events that
-// the loader does not classify as replay or blocking.
-type CoveredEvent = (typeof REPLAY_EVENTS)[number] | (typeof BLOCKING_EVENTS)[number];
+// the loader does not classify as replay, blocking, or startup.
+type CoveredEvent =
+	| (typeof REPLAY_EVENTS)[number]
+	| (typeof BLOCKING_EVENTS)[number]
+	| (typeof STARTUP_EVENTS)[number];
 type UncoveredEventMustBeNever = [Exclude<ExtensionEvent["type"], CoveredEvent>] extends [never] ? true : never;
 const uncoveredEventCheck: UncoveredEventMustBeNever = true;
 void uncoveredEventCheck;
 
-register("classifies every Pi 0.84.3 extension event as replay or blocking", () => {
-	const covered = new Set<string>([...REPLAY_EVENTS, ...BLOCKING_EVENTS]);
-	for (const event of PI_0_84_3_EVENTS) {
+register("classifies every Pi 0.84.4 extension event (0.84.3 ships a 34-event subset)", () => {
+	const covered = new Set<string>([...REPLAY_EVENTS, ...BLOCKING_EVENTS, ...STARTUP_EVENTS]);
+	for (const event of PI_0_84_4_EVENTS) {
 		assert.ok(covered.has(event), `unclassified event: ${event}`);
 	}
-	assert.strictEqual(covered.size, PI_0_84_3_EVENTS.length);
-	assert.ok(covered.has("resources_discover"), "resources_discover must be delivered to the real factory");
+	assert.strictEqual(covered.size, PI_0_84_4_EVENTS.length);
+	assert.ok(!BLOCKING_EVENTS.includes("resources_discover" as never), "resources_discover must stay a startup capability");
+	assert.ok(!BLOCKING_EVENTS.includes("project_trust" as never), "project_trust must stay a startup capability");
 });
 
-register("delays resources_discover so the real factory paths are aggregated", async () => {
+register("startup events do not load the factory synchronously", async () => {
 	const { pi, emit } = createFakePi();
+	let loadCalls = 0;
+	const load: DeferredLoad = async () => {
+		loadCalls += 1;
+		return { default: () => undefined };
+	};
+	installDeferred(pi, load);
+	await emit("session_start");
+	await emit("resources_discover");
+	await emit("project_trust");
+	// Startup dispatches must complete without blocking on the factory; only
+	// the asynchronous session_start warmup may preload it off the hot path.
+	assert.strictEqual(loadCalls, 0, "startup dispatches must not eagerly load an undeclared factory");
+	await new Promise((resolve) => setTimeout(resolve, 400));
+	assert.strictEqual(loadCalls, 1, "session_start warmup still preloads asynchronously");
+});
+
+register("declared startup events deliver the real factory into resource discovery", async () => {
+	const { pi, handlers, emit } = createFakePi();
+	let factoryCalls = 0;
 	const load = (async () => ({
 		default: (runtime: unknown) => {
+			factoryCalls += 1;
 			(runtime as DeferredPi).on("resources_discover", () => ({ skillPaths: ["/skills/late"] }));
 		},
 	})) as unknown as DeferredLoad;
-	installDeferred(pi, load);
+	installDeferred(pi, load, { startupEvents: ["resources_discover"] });
+	assert.strictEqual((handlers.get("resources_discover") ?? []).length, 1, "declared startup stub must be registered");
 	const results = await emit("resources_discover");
+	assert.strictEqual(factoryCalls, 1);
 	const aggregated = results.find(
 		(result) => result && typeof result === "object" && "skillPaths" in result,
 	) as { skillPaths: string[] } | undefined;
@@ -329,22 +358,41 @@ register("dynamic import of the real runtime module yields a callable factory", 
 });
 
 register("installs the real runtime module through the real deferred loader", { timeout: 120000 }, async () => {
-	const { pi, emit, observed } = createFakePi();
+	const { pi, handlers, emit, observed } = createFakePi();
 	const realLoad: DeferredLoad = async () => import("../src/index.ts");
 	installDeferred(pi, realLoad);
 	// Snapshot after install: the stub wrappers themselves register handlers,
 	// so growth beyond this point proves the real factory ran.
 	const before = observed();
-	let failure: unknown;
-	try {
-		await emit("tool_call");
-	} catch (error) {
-		failure = error;
-	}
+	await emit("tool_call");
 	assert.ok(observed() > before, "real factory must register handlers, commands, or tools");
-	if (failure !== undefined) {
-		const message = failure instanceof Error ? failure.message : String(failure);
-		assert.doesNotMatch(message, /does not export a factory/);
-		assert.doesNotMatch(message, /Cannot find module/);
+	// Capability cross-check: a factory that never declared resources_discover
+	// must not register handlers for it.
+	const rdHandlers = (handlers.get("resources_discover") ?? []).length;
+	assert.strictEqual(rdHandlers, 0);
+});
+
+register("real bootstrap declares matching capabilities and loads the real factory", { timeout: 120000 }, async () => {
+	const { pi, handlers, commands, emit, observed } = createFakePi();
+	const bootstrap = (await import("../src/bootstrap.ts")).default as (pi: DeferredPi) => unknown;
+	await bootstrap(pi);
+	for (const name of ["gateway"]) {
+		assert.ok(commands.has(name), `bootstrap stub command missing: ${name}`);
 	}
+	const startupStubs = (handlers.get("resources_discover") ?? []).length;
+	assert.strictEqual(startupStubs > 0, false, "bootstrap startupEvents must match the declared capability");
+	const before = observed();
+	// Factories may re-register a stub command name (same Map key), so track
+	// object identity: a swapped options object proves the real factory ran.
+	const commandIdentity = new Map(["gateway"].map((name) => [name, commands.get(name)]));
+	await emit("tool_call");
+	const realigned = ["gateway"].some((name) => commands.get(name) !== commandIdentity.get(name));
+	assert.ok(
+		realigned || observed() > before,
+		"real factory must register or re-register through the loader",
+	);
+	// After a clean install the factory's own resources_discover handler (for
+	// capability repos) has joined the stub: 2 handlers when declared, else 0.
+	const rdHandlers = (handlers.get("resources_discover") ?? []).length;
+	assert.strictEqual(rdHandlers, 0);
 });

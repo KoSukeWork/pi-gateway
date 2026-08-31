@@ -23,7 +23,6 @@ async function loadWithRetry<T>(load: () => Promise<T>, onError?: (error: unknow
 export const REPLAY_EVENTS = ["session_start"] as const;
 
 export const BLOCKING_EVENTS = [
-	"resources_discover",
 	"session_shutdown",
 	"session_info_changed",
 	"session_before_switch",
@@ -33,7 +32,6 @@ export const BLOCKING_EVENTS = [
 	"session_compact",
 	"session_compact_failed",
 	"session_tree",
-	"project_trust",
 	"before_agent_start",
 	"before_provider_request",
 	"before_provider_headers",
@@ -59,6 +57,12 @@ export const BLOCKING_EVENTS = [
 	"thinking_level_select",
 	"context",
 ] as const;
+
+// Startup events are only registered when the bootstrap declares them via
+// installDeferred options. resources_discover runs right after session_start
+// on every host startup, so registering it unconditionally would load the
+// factory during startup and defeat deferred loading.
+export const STARTUP_EVENTS = ["resources_discover", "project_trust"] as const;
 
 type ExtensionFactory = (pi: ExtensionAPI) => unknown;
 type CommandHandler = (args: string, ctx: unknown) => unknown;
@@ -96,6 +100,7 @@ function wrapRuntimePi(
 	realCommands: Map<string, CommandHandler>,
 	realCompletions: Map<string, CompletionsFn>,
 	replayQueue: Array<{ event: string; run: () => unknown }>,
+	commitQueue: Array<() => void>,
 ): ExtensionAPI {
 	const origOn = pi.on.bind(pi);
 	const origRegisterCommand = pi.registerCommand.bind(pi);
@@ -103,7 +108,7 @@ function wrapRuntimePi(
 		get(target, prop, receiver) {
 			if (prop === "on") {
 				return (event: string, handler: (event: unknown, ctx: unknown) => unknown) => {
-					origOn(event as never, handler as never);
+					commitQueue.push(() => origOn(event as never, handler as never));
 					const saved = pending.get(event);
 					if (!saved) return;
 					replayQueue.push({ event, run: () => handler(saved.event, saved.ctx) });
@@ -122,7 +127,7 @@ function wrapRuntimePi(
 					if (typeof options.getArgumentCompletions === "function") {
 						realCompletions.set(name, options.getArgumentCompletions);
 					}
-					return origRegisterCommand(name, options as never);
+					commitQueue.push(() => origRegisterCommand(name, options as never));
 				};
 			}
 			const value = Reflect.get(target, prop, receiver);
@@ -134,13 +139,14 @@ function wrapRuntimePi(
 export function installDeferred(
 	pi: ExtensionAPI,
 	load: () => Promise<{ default: ExtensionFactory }>,
-	options: { commands?: DeferredCommand[] } = {},
+	options: { commands?: DeferredCommand[]; startupEvents?: ReadonlyArray<(typeof STARTUP_EVENTS)[number]> } = {},
 ): void {
 	const pending = new Map<string, { event: unknown; ctx: unknown }>();
 	const realCommands = new Map<string, CommandHandler>();
 	const realCompletions = new Map<string, CompletionsFn>();
 	const replayQueue: Array<{ event: string; run: () => unknown }> = [];
-	const runtimePi = wrapRuntimePi(pi, pending, realCommands, realCompletions, replayQueue);
+	const commitQueue: Array<() => void> = [];
+	const runtimePi = wrapRuntimePi(pi, pending, realCommands, realCompletions, replayQueue, commitQueue);
 	let ready: Promise<unknown> | undefined;
 	let warmupTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -171,10 +177,15 @@ export function installDeferred(
 						}
 						throw error;
 					}
+					for (const commit of commitQueue) {
+						commit();
+					}
 					for (const replay of replayQueue) {
 						try {
 							await replay.run();
 						} catch (error) {
+							// Reported here rather than through Pi's emitError pipeline: the deferred
+							// loader has no runner handle, so hosts observe this on stderr only.
 							const message = error instanceof Error ? error.stack ?? error.message : String(error);
 							console.error(`[pi-lazy-extension] replay ${replay.event} failed: ${message}`);
 						}
@@ -234,6 +245,11 @@ export function installDeferred(
 				warmupTimer = undefined;
 				if (!ready) return;
 			}
+			await ensure();
+		});
+	}
+	for (const event of options.startupEvents ?? []) {
+		on(event, async () => {
 			await ensure();
 		});
 	}
