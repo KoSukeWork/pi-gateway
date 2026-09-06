@@ -20,6 +20,7 @@ import { DISCORD_SLASH_COMMANDS, slashInteractionToContent } from "./slash-comma
 import {
   buildDiscordInteractiveMessage,
   parseDiscordButtonCustomId,
+  splitDiscordContent,
   truncateDiscordContent,
   truncateDiscordLabel,
 } from "./discord-interactive.js";
@@ -336,7 +337,15 @@ export class DiscordAdapter extends BaseAdapter {
   }
 
   async sendMessage(channelId: string, content: string): Promise<string> {
-    return this.sendDiscordMessage(channelId, { content });
+    const chunks = splitDiscordContent(content);
+    if (chunks.length === 0) {
+      throw new Error("Refusing to send an empty Discord message");
+    }
+    let lastId = "";
+    for (const chunk of chunks) {
+      lastId = await this.sendDiscordMessage(channelId, { content: chunk });
+    }
+    return lastId;
   }
 
   async sendButtons(
@@ -381,10 +390,21 @@ export class DiscordAdapter extends BaseAdapter {
   }
 
   async editMessage(channelId: string, messageId: string, content: string): Promise<void> {
-    await this.apiRequest(`/channels/${channelId}/messages/${messageId}`, {
+    const chunks = splitDiscordContent(content);
+    if (chunks.length === 0) {
+      return;
+    }
+    const response = await this.apiRequest(`/channels/${channelId}/messages/${messageId}`, {
       method: "PATCH",
-      body: JSON.stringify({ content }),
+      body: JSON.stringify({ content: chunks[0] }),
     });
+    if (!response.ok) {
+      const error = await response.text();
+      throw new Error(`Failed to edit message: ${error}`);
+    }
+    for (const extra of chunks.slice(1)) {
+      await this.sendDiscordMessage(channelId, { content: extra });
+    }
   }
 
   async deleteMessage(channelId: string, messageId: string): Promise<void> {

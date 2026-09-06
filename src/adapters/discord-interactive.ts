@@ -44,6 +44,34 @@ export function truncateDiscordContent(
 	return text.slice(0, max - marker.length) + marker;
 }
 
+/**
+ * Split a Discord message into <=max chunks, preferring newline then space.
+ * Empty / whitespace-only input yields no chunks (Discord rejects "").
+ */
+export function splitDiscordContent(
+	text: string,
+	max = DISCORD_CONTENT_MAX,
+): string[] {
+	if (max < 1) return text ? [text] : [];
+	const normalized = text.replace(/\r\n/g, "\n");
+	if (!normalized.trim()) return [];
+	if (normalized.length <= max) return [normalized];
+	const chunks: string[] = [];
+	let rest = normalized;
+	const minCut = Math.floor(max * 0.4);
+	while (rest.length > max) {
+		const window = rest.slice(0, max);
+		let cut = window.lastIndexOf("\n");
+		if (cut < minCut) cut = window.lastIndexOf(" ");
+		if (cut < minCut) cut = max;
+		const chunk = rest.slice(0, cut).trimEnd();
+		if (chunk) chunks.push(chunk);
+		rest = rest.slice(cut).replace(/^\s+/, "");
+	}
+	if (rest) chunks.push(rest);
+	return chunks;
+}
+
 export function truncateDiscordLabel(
 	label: string,
 	max = DISCORD_BUTTON_LABEL_MAX,

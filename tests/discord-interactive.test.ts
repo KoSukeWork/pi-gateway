@@ -3,6 +3,7 @@ import {
 	buildDiscordInteractiveMessage,
 	DISCORD_CONTENT_MAX,
 	parseDiscordButtonCustomId,
+	splitDiscordContent,
 	truncateDiscordContent,
 	truncateDiscordLabel,
 } from "../src/adapters/discord-interactive.js";
@@ -13,6 +14,23 @@ assert.ok(truncateDiscordContent("x".repeat(5000)).length <= DISCORD_CONTENT_MAX
 assert.ok(truncateDiscordContent("x".repeat(5000)).endsWith("…(truncated)"));
 assert.equal(truncateDiscordLabel("Yes"), "Yes");
 assert.equal(truncateDiscordLabel("y".repeat(90)).length, 80);
+
+assert.deepEqual(splitDiscordContent(""), []);
+assert.deepEqual(splitDiscordContent("   "), []);
+assert.deepEqual(splitDiscordContent("short"), ["short"]);
+{
+	const parts = splitDiscordContent(`${"a".repeat(1500)}\n${"b".repeat(1500)}`);
+	assert.equal(parts.length, 2);
+	assert.ok(parts.every((part) => part.length <= DISCORD_CONTENT_MAX));
+	assert.equal(parts[0], "a".repeat(1500));
+	assert.equal(parts[1], "b".repeat(1500));
+}
+{
+	const parts = splitDiscordContent("x".repeat(4500));
+	assert.ok(parts.length >= 3);
+	assert.ok(parts.every((part) => part.length <= DISCORD_CONTENT_MAX));
+	assert.equal(parts.join(""), "x".repeat(4500));
+}
 
 const requestId = "550e8400-e29b-41d4-a716-446655440000";
 const select = buildDiscordInteractiveMessage({

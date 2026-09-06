@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.16.2] - 2026-09-06
+
+### Fixed
+- Discord replies over 2000 characters are split instead of being dropped. Message edits now fail on Discord API errors (with a new-message fallback), RPC stdout uses a streaming UTF-8 decoder, and unparseable RPC lines are logged at warn.
+
+## [1.16.1]
+
 ### Fixed
 - Deferred runtime install failures now include the first load error (for example a missing dependency) instead of reporting only a missing factory, and a factory that already started executing is never re-run.
 - Deferred loading is preserved: startup events (resources_discover, project_trust) are registered only when the bootstrap declares startupEvents, and factory on()/registerCommand() registrations commit only after the factory completes.

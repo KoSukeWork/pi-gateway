@@ -462,9 +462,10 @@ function createRpcProcess(): any {
 		}
 	});
 
+	const stdoutDecoder = new TextDecoder();
 	let lineBuffer = "";
 	proc.stdout?.on("data", (data: Buffer) => {
-		lineBuffer += data.toString();
+		lineBuffer += stdoutDecoder.decode(data, { stream: true });
 		const lines = lineBuffer.split("\n");
 		// Keep the last (possibly incomplete) chunk in the buffer
 		lineBuffer = lines.pop() || "";
@@ -553,7 +554,7 @@ function createRpcProcess(): any {
 					broadcastClients("event", msg);
 				}
 			} catch {
-				logger.debug("[gateway] Failed to parse RPC line:", line.slice(0, 200));
+				logger.warn("[gateway] Failed to parse RPC line:", line.slice(0, 200));
 			}
 		}
 	});
@@ -1409,9 +1410,25 @@ const adapterCallbacks: AdapterCallbacks = {
 						}
 					}
 					if (sentId) {
-						await adapter.editMessage(message.channelId, sentId, finalText);
+						if (finalText) {
+							try {
+								await adapter.editMessage(message.channelId, sentId, finalText);
+							} catch (err) {
+								logger.warn(
+									"[gateway] Failed to edit response message, sending a new one:",
+									err,
+								);
+								await adapter.sendMessage(message.channelId, finalText);
+							}
+						}
 					} else {
-						await adapter.sendMessage(message.channelId, finalText);
+						if (finalText) {
+							await adapter.sendMessage(message.channelId, finalText);
+						} else {
+							logger.warn(
+								"[gateway] Response text was empty after flush stripping - nothing new to send",
+							);
+						}
 					}
 					clearInterval(typingInterval);
 					await adapter.setTyping(message.channelId, false);
