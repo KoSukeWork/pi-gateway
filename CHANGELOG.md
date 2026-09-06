@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.16.3] - 2026-09-06
+
+### Fixed
+- Discord `/model` now sends the full text catalog instead of a 5-button keyboard, so NewAPI model lists are no longer truncated.
+
 ## [1.16.2] - 2026-09-06
 
 ### Fixed

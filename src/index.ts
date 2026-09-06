@@ -39,6 +39,10 @@ import {
 	routeChatMessage,
 	stillWorkingNotice,
 } from "./prompt-routing.js";
+import {
+	formatModelListText,
+	modelListUsesInlineButtons,
+} from "./model-list.js";
 
 import type {
 	ExtensionAPI,
@@ -1116,7 +1120,11 @@ const adapterCallbacks: AdapterCallbacks = {
 								btns: Array<Array<{ text: string; data: string }>>,
 							) => Promise<string>;
 						};
-						if (telegram?.sendButtons) {
+						if (
+							adapter &&
+							modelListUsesInlineButtons(adapter.platform) &&
+							telegram.sendButtons
+						) {
 							const buttons = models.map((m) => [
 								{
 									text: `${m.name} (${m.provider})`,
@@ -1129,13 +1137,9 @@ const adapterCallbacks: AdapterCallbacks = {
 								buttons,
 							);
 						} else if (adapter) {
-							// Text fallback
-							const list = models
-								.map((m) => `• ${m.provider}/${m.id} — ${m.name}`)
-								.join("\n");
 							await adapter.sendMessage(
 								message.channelId,
-								`Available models:\n${list}\n\nUse \`/model provider/id\` to switch.`,
+								formatModelListText(models),
 							);
 						}
 					} else if (adapter) {
