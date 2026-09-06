@@ -1145,7 +1145,7 @@ const adapterCallbacks: AdapterCallbacks = {
 					} else if (adapter) {
 						await adapter.sendMessage(
 							message.channelId,
-							"Could not retrieve model list.",
+							"Could not retrieve model list from the agent.",
 						);
 					}
 				} catch (err) {
@@ -1153,7 +1153,7 @@ const adapterCallbacks: AdapterCallbacks = {
 					if (adapter) {
 						await adapter.sendMessage(
 							message.channelId,
-							"Failed to retrieve model list.",
+							"Failed to send the model list to Discord. Try /model again in a few seconds.",
 						);
 					}
 				}

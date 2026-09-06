@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
 	buildDiscordInteractiveMessage,
 	DISCORD_CONTENT_MAX,
+	discordRetryAfterMs,
 	parseDiscordButtonCustomId,
 	splitDiscordContent,
 	truncateDiscordContent,
@@ -31,6 +32,9 @@ assert.deepEqual(splitDiscordContent("short"), ["short"]);
 	assert.ok(parts.every((part) => part.length <= DISCORD_CONTENT_MAX));
 	assert.equal(parts.join(""), "x".repeat(4500));
 }
+assert.equal(discordRetryAfterMs(400, "{}"), null);
+assert.equal(discordRetryAfterMs(429, "{\"retry_after\":0.3}"), 350);
+assert.equal(discordRetryAfterMs(429, "not-json"), 500);
 
 const requestId = "550e8400-e29b-41d4-a716-446655440000";
 const select = buildDiscordInteractiveMessage({

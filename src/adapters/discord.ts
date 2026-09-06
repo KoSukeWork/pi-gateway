@@ -19,6 +19,7 @@ import { logger } from "../logger.js";
 import { DISCORD_SLASH_COMMANDS, slashInteractionToContent } from "./slash-commands.js";
 import {
   buildDiscordInteractiveMessage,
+  discordRetryAfterMs,
   parseDiscordButtonCustomId,
   splitDiscordContent,
   truncateDiscordContent,
@@ -343,6 +344,9 @@ export class DiscordAdapter extends BaseAdapter {
     }
     let lastId = "";
     for (const chunk of chunks) {
+      if (lastId) {
+        await new Promise((resolve) => setTimeout(resolve, 350));
+      }
       lastId = await this.sendDiscordMessage(channelId, { content: chunk });
     }
     return lastId;
@@ -372,21 +376,26 @@ export class DiscordAdapter extends BaseAdapter {
     channelId: string,
     body: { content: string; components?: ReturnType<typeof buildDiscordInteractiveMessage>["components"] },
   ): Promise<string> {
-    const response = await this.apiRequest(`/channels/${channelId}/messages`, {
-      method: "POST",
-      body: JSON.stringify(body),
-    });
-
-    if (!response.ok) {
+    const maxAttempts = 5;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const response = await this.apiRequest(`/channels/${channelId}/messages`, {
+        method: "POST",
+        body: JSON.stringify(body),
+      });
+      if (response.ok) {
+        const data = (await response.json()) as { id: string };
+        return data.id;
+      }
       const error = await response.text();
-      if (response.status === 429) {
-        logger.warn(`[Discord] Rate limited while sending: ${error}`);
+      const waitMs = discordRetryAfterMs(response.status, error);
+      if (waitMs !== null && attempt < maxAttempts) {
+        logger.warn(`[Discord] Rate limited, retrying in ${waitMs}ms`);
+        await new Promise((resolve) => setTimeout(resolve, waitMs));
+        continue;
       }
       throw new Error(`Failed to send message: ${error}`);
     }
-
-    const data = (await response.json()) as { id: string };
-    return data.id;
+    throw new Error("Failed to send message: exhausted Discord retries");
   }
 
   async editMessage(channelId: string, messageId: string, content: string): Promise<void> {

@@ -72,6 +72,23 @@ export function splitDiscordContent(
 	return chunks;
 }
 
+/** Discord 429 `retry_after` is seconds. Returns null when the status is not 429. */
+export function discordRetryAfterMs(status: number, body: string): number | null {
+	if (status !== 429) return null;
+	try {
+		const parsed = JSON.parse(body) as { retry_after?: unknown };
+		if (typeof parsed.retry_after === "number" && Number.isFinite(parsed.retry_after)) {
+			return Math.min(
+				Math.max(Math.ceil(parsed.retry_after * 1000) + 50, 50),
+				15_000,
+			);
+		}
+	} catch {
+		// use fallback
+	}
+	return 500;
+}
+
 export function truncateDiscordLabel(
 	label: string,
 	max = DISCORD_BUTTON_LABEL_MAX,

@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.16.4] - 2026-09-06
+
+### Fixed
+- Retry Discord 429s using `retry_after` and pause between split messages so a large `/model` catalog is not dropped as "Failed to retrieve model list."
+
 ## [1.16.3] - 2026-09-06
 
 ### Fixed
