@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.16.7] - 2026-09-07
+
+### Fixed
+- Isolate Discord model pickers by message and owner, enforce expiry, preserve case and `/` characters in model IDs, and use typed select-menu components.
+- Tear down Discord heartbeat/socket state on fatal closes, reset heartbeat cadence after server requests, and report the actual WebSocket connection state.
+- Restart daemon resources in-process instead of self-signalling on Windows.
+- Retry rate-limited Discord edits and avoid duplicating already delivered chunks when a later overflow message fails.
+- Close SQLite stores on extension shutdown so isolated Windows tests and reloads release their files.
+
 ## [1.16.6] - 2026-09-07
 
 ### Changed

@@ -17,12 +17,32 @@ export interface DiscordButton {
 	style: number;
 	label: string;
 	custom_id: string;
+	disabled?: boolean;
 }
 
-export interface DiscordActionRow {
+export interface DiscordStringSelectOption {
+	label: string;
+	value: string;
+	description?: string;
+}
+
+export interface DiscordStringSelect {
+	type: 3;
+	custom_id: string;
+	placeholder?: string;
+	min_values?: number;
+	max_values?: number;
+	options: DiscordStringSelectOption[];
+	disabled?: boolean;
+}
+
+export type DiscordActionRow = {
 	type: 1;
 	components: DiscordButton[];
-}
+} | {
+	type: 1;
+	components: [DiscordStringSelect];
+};
 
 export interface DiscordInteractiveMessage {
 	content: string;
@@ -62,11 +82,18 @@ export function splitDiscordContent(
 	while (rest.length > max) {
 		const window = rest.slice(0, max);
 		let cut = window.lastIndexOf("\n");
-		if (cut < minCut) cut = window.lastIndexOf(" ");
-		if (cut < minCut) cut = max;
+		let skipDelimiter = cut >= minCut;
+		if (cut < minCut) {
+			cut = window.lastIndexOf(" ");
+			skipDelimiter = cut >= minCut;
+		}
+		if (cut < minCut) {
+			cut = max;
+			skipDelimiter = false;
+		}
 		const chunk = rest.slice(0, cut).trimEnd();
 		if (chunk) chunks.push(chunk);
-		rest = rest.slice(cut).replace(/^\s+/, "");
+		rest = rest.slice(cut + (skipDelimiter ? 1 : 0));
 	}
 	if (rest) chunks.push(rest);
 	return chunks;

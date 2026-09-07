@@ -3,6 +3,7 @@ import {
 	buildDiscordModelPicker,
 	DISCORD_MODEL_BACK_ID,
 	DISCORD_MODEL_PAGE_SIZE,
+	DISCORD_MODEL_PICKER_MAX_ENTRIES,
 	DISCORD_MODEL_PICKER_TTL_MS,
 	DISCORD_MODEL_SELECT_ID,
 	DISCORD_PROVIDER_SELECT_ID,
@@ -11,6 +12,7 @@ import {
 	initialDiscordModelPickerView,
 	listDiscordProviders,
 	modelListUsesInlineButtons,
+	parseModelKey,
 	parseDiscordModelPageCustomId,
 	parseDiscordProviderPageCustomId,
 	rememberDiscordModelPicker,
@@ -130,12 +132,64 @@ assert.deepEqual(parseDiscordProviderPageCustomId("modelprovpage:stay:1"), {
 	stay: true,
 });
 
-rememberDiscordModelPicker("chan", catalog, 1000);
-const saved = getDiscordModelPickerState("chan", 1000);
+rememberDiscordModelPicker("chan", "message-1", "user-1", catalog, 1000);
+rememberDiscordModelPicker(
+	"chan",
+	"message-2",
+	"user-2",
+	[{ provider: "Other", id: "other", name: "Other" }],
+	1000,
+);
+const saved = getDiscordModelPickerState("chan", "message-1", 1000);
 assert.equal(saved?.view.provider, null);
+assert.equal(saved?.ownerUserId, "user-1");
 assert.equal(
-	getDiscordModelPickerState("chan", 1000 + DISCORD_MODEL_PICKER_TTL_MS + 1),
+	getDiscordModelPickerState("chan", "message-2", 1000)?.models[0].provider,
+	"Other",
+);
+assert.equal(
+	getDiscordModelPickerState(
+		"chan",
+		"message-1",
+		1000 + DISCORD_MODEL_PICKER_TTL_MS + 1,
+	),
 	null,
+);
+
+assert.deepEqual(parseModelKey("Work/gpt-5"), {
+	provider: "Work",
+	modelId: "gpt-5",
+});
+assert.deepEqual(parseModelKey("Work/openrouter/anthropic/claude"), {
+	provider: "Work",
+	modelId: "openrouter/anthropic/claude",
+});
+assert.deepEqual(parseModelKey("MixedCase/Model-ID"), {
+	provider: "MixedCase",
+	modelId: "Model-ID",
+});
+assert.equal(parseModelKey("missing-separator"), null);
+assert.equal(parseModelKey("Work/"), null);
+
+for (let index = 0; index <= DISCORD_MODEL_PICKER_MAX_ENTRIES; index++) {
+	rememberDiscordModelPicker(
+		"bounded",
+		`message-${index}`,
+		"owner",
+		catalog,
+		2000 + index,
+	);
+}
+assert.equal(
+	getDiscordModelPickerState("bounded", "message-0", 3000),
+	null,
+);
+assert.ok(
+	getDiscordModelPickerState(
+		"bounded",
+		`message-${DISCORD_MODEL_PICKER_MAX_ENTRIES}`,
+		3000,
+	),
 );
 
 console.log("model-list tests passed");

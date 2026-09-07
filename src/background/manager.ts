@@ -109,6 +109,13 @@ export function initBackgroundTasks(): Database.Database {
 	return db;
 }
 
+/** Release the SQLite handle when the extension session shuts down. */
+export function closeBackgroundTasks(): void {
+	if (!db) return;
+	db.close();
+	db = null;
+}
+
 /**
  * Start a background task
  */

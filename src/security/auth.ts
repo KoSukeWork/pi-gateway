@@ -131,6 +131,13 @@ export function initSecurityStore(): Database.Database {
 	return db;
 }
 
+/** Release the SQLite handle when the extension session shuts down. */
+export function closeSecurityStore(): void {
+	if (!db) return;
+	db.close();
+	db = null;
+}
+
 /**
  * Generate pairing code
  */

@@ -38,6 +38,7 @@ import {
   DISCORD_MODEL_BACK_ID,
   DISCORD_MODEL_SELECT_ID,
   DISCORD_PROVIDER_SELECT_ID,
+  forgetDiscordModelPicker,
   getDiscordModelPickerState,
   listDiscordProviders,
   parseDiscordModelPageCustomId,
@@ -81,6 +82,7 @@ export class DiscordAdapter extends BaseAdapter {
   private applicationId: string | null = null;
   private intents: number = 0;
   private heartbeatAcked = true;
+  private heartbeatIntervalMs = 0;
   private heartbeatTimeout: ReturnType<typeof setTimeout> | null = null;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempt = 0;
@@ -153,6 +155,8 @@ export class DiscordAdapter extends BaseAdapter {
       this.lastCloseCode = event.code;
       if (isDiscordFatalClose(event.code)) {
         logger.error("[Discord] Fatal gateway close — not reconnecting");
+        this.teardownSocket();
+        this.running = false;
         this.sessionId = null;
         this.sequence = null;
         return;
@@ -227,12 +231,13 @@ export class DiscordAdapter extends BaseAdapter {
 
   private startHeartbeat(interval: number): void {
     this.clearHeartbeat();
+    this.heartbeatIntervalMs = interval;
     this.heartbeatAcked = true;
     const delay = Math.max(0, interval * Math.random());
     this.heartbeatTimeout = setTimeout(() => {
       this.heartbeatTimeout = null;
       this.sendHeartbeat();
-      this.heartbeatInterval = setInterval(() => this.sendHeartbeat(), interval);
+      this.scheduleHeartbeatInterval();
     }, delay);
   }
 
@@ -246,6 +251,25 @@ export class DiscordAdapter extends BaseAdapter {
     if (this.wsConnection?.readyState !== WebSocket.OPEN) return;
     this.heartbeatAcked = false;
     this.wsConnection.send(JSON.stringify(buildDiscordHeartbeat(this.sequence)));
+    if (force) {
+      if (this.heartbeatTimeout) {
+        clearTimeout(this.heartbeatTimeout);
+        this.heartbeatTimeout = null;
+      }
+      this.scheduleHeartbeatInterval();
+    }
+  }
+
+  private scheduleHeartbeatInterval(): void {
+    if (this.heartbeatInterval) clearInterval(this.heartbeatInterval);
+    if (this.heartbeatIntervalMs <= 0) {
+      this.heartbeatInterval = null;
+      return;
+    }
+    this.heartbeatInterval = setInterval(
+      () => this.sendHeartbeat(),
+      this.heartbeatIntervalMs,
+    );
   }
 
   private identify(): void {
@@ -311,6 +335,7 @@ export class DiscordAdapter extends BaseAdapter {
       clearInterval(this.heartbeatInterval);
       this.heartbeatInterval = null;
     }
+    this.heartbeatIntervalMs = 0;
   }
 
   private clearReconnectTimer(): void {
@@ -454,7 +479,28 @@ export class DiscordAdapter extends BaseAdapter {
     const customId: string = data.data?.custom_id ?? "";
     const values: string[] = data.data?.values ?? [];
     const channelId = data.channel_id as string | undefined;
-    if (!channelId) return false;
+    const messageId = data.message?.id as string | undefined;
+    const userId = (data.member?.user?.id ?? data.user?.id) as string | undefined;
+    const modelPage = parseDiscordModelPageCustomId(customId);
+    const providerPage = parseDiscordProviderPageCustomId(customId);
+    const isModelPickerInteraction =
+      customId === DISCORD_PROVIDER_SELECT_ID ||
+      customId === DISCORD_MODEL_SELECT_ID ||
+      customId === DISCORD_MODEL_BACK_ID ||
+      customId.startsWith("modelpage:") ||
+      customId.startsWith("modelprovpage:");
+    if (!isModelPickerInteraction) return false;
+
+    if (!channelId || !messageId || !userId) {
+      await this.ackInteraction(data, {
+        type: 4,
+        data: {
+          content: "Could not identify this model picker. Run /model again.",
+          flags: 64,
+        },
+      });
+      return true;
+    }
 
     const expired = async () => {
       await this.ackInteraction(data, {
@@ -466,12 +512,23 @@ export class DiscordAdapter extends BaseAdapter {
       });
     };
 
+    const state = getDiscordModelPickerState(channelId, messageId);
+    if (!state) {
+      await expired();
+      return true;
+    }
+    if (state.ownerUserId !== userId) {
+      await this.ackInteraction(data, {
+        type: 4,
+        data: {
+          content: "This model picker belongs to another user. Run /model to open your own.",
+          flags: 64,
+        },
+      });
+      return true;
+    }
+
     if (customId === DISCORD_PROVIDER_SELECT_ID) {
-      const state = getDiscordModelPickerState(channelId);
-      if (!state) {
-        await expired();
-        return true;
-      }
       const provider = resolveDiscordProviderSelection(
         values[0] ?? "",
         listDiscordProviders(state.models),
@@ -480,7 +537,7 @@ export class DiscordAdapter extends BaseAdapter {
         await this.ackInteraction(data, { type: 6 });
         return true;
       }
-      const next = updateDiscordModelPickerView(channelId, {
+      const next = updateDiscordModelPickerView(channelId, messageId, {
         provider,
         page: 0,
       });
@@ -493,8 +550,7 @@ export class DiscordAdapter extends BaseAdapter {
     }
 
     if (customId === DISCORD_MODEL_SELECT_ID) {
-      const state = getDiscordModelPickerState(channelId);
-      const key = resolveDiscordModelSelection(values[0] ?? "", state?.models ?? null);
+      const key = resolveDiscordModelSelection(values[0] ?? "", state.models);
       await this.ackInteraction(data, {
         type: 7,
         data: {
@@ -503,18 +559,14 @@ export class DiscordAdapter extends BaseAdapter {
         },
       });
       if (key) {
+        forgetDiscordModelPicker(channelId, messageId);
         await this.emitCallback(data, `model:${key}`);
       }
       return true;
     }
 
     if (customId === DISCORD_MODEL_BACK_ID) {
-      const state = getDiscordModelPickerState(channelId);
-      if (!state) {
-        await expired();
-        return true;
-      }
-      const next = updateDiscordModelPickerView(channelId, {
+      const next = updateDiscordModelPickerView(channelId, messageId, {
         provider: null,
         page: 0,
       });
@@ -526,18 +578,16 @@ export class DiscordAdapter extends BaseAdapter {
       return true;
     }
 
-    const modelPage = parseDiscordModelPageCustomId(customId);
     if (modelPage) {
       if (modelPage.stay) {
         await this.ackInteraction(data, { type: 6 });
         return true;
       }
-      const state = getDiscordModelPickerState(channelId);
-      if (!state?.view.provider) {
+      if (!state.view.provider) {
         await expired();
         return true;
       }
-      const next = updateDiscordModelPickerView(channelId, {
+      const next = updateDiscordModelPickerView(channelId, messageId, {
         provider: state.view.provider,
         page: modelPage.page,
       });
@@ -546,18 +596,12 @@ export class DiscordAdapter extends BaseAdapter {
       return true;
     }
 
-    const providerPage = parseDiscordProviderPageCustomId(customId);
     if (providerPage) {
       if (providerPage.stay) {
         await this.ackInteraction(data, { type: 6 });
         return true;
       }
-      const state = getDiscordModelPickerState(channelId);
-      if (!state) {
-        await expired();
-        return true;
-      }
-      const next = updateDiscordModelPickerView(channelId, {
+      const next = updateDiscordModelPickerView(channelId, messageId, {
         provider: null,
         page: providerPage.page,
       });
@@ -672,40 +716,54 @@ export class DiscordAdapter extends BaseAdapter {
     });
   }
 
-  async sendModelPicker(channelId: string, models: CatalogModel[]): Promise<string> {
-    rememberDiscordModelPicker(channelId, models);
-    const state = getDiscordModelPickerState(channelId);
-    const payload = buildDiscordModelPicker(
-      state?.models ?? models,
-      state?.view,
-    );
-    return this.sendDiscordMessage(channelId, payload);
+  async sendModelPicker(
+    channelId: string,
+    ownerUserId: string,
+    models: CatalogModel[],
+  ): Promise<string> {
+    const payload = buildDiscordModelPicker(models);
+    const messageId = await this.sendDiscordMessage(channelId, payload);
+    rememberDiscordModelPicker(channelId, messageId, ownerUserId, models);
+    return messageId;
   }
 
   private async sendDiscordMessage(
     channelId: string,
     body: { content: string; components?: ReturnType<typeof buildDiscordInteractiveMessage>["components"] },
   ): Promise<string> {
-    const maxAttempts = 5;
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-      const response = await this.apiRequest(`/channels/${channelId}/messages`, {
+    const response = await this.requestDiscordWithRetry(
+      `/channels/${channelId}/messages`,
+      {
         method: "POST",
         body: JSON.stringify(body),
-      });
-      if (response.ok) {
-        const data = (await response.json()) as { id: string };
-        return data.id;
-      }
+      },
+      "send message",
+    );
+    const data = (await response.json()) as { id: string };
+    return data.id;
+  }
+
+  private async requestDiscordWithRetry(
+    endpoint: string,
+    options: RequestInit,
+    action: string,
+  ): Promise<Response> {
+    const maxAttempts = 5;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const response = await this.apiRequest(endpoint, options);
+      if (response.ok) return response;
       const error = await response.text();
       const waitMs = discordRetryAfterMs(response.status, error);
       if (waitMs !== null && attempt < maxAttempts) {
-        logger.warn(`[Discord] Rate limited, retrying in ${waitMs}ms`);
+        logger.warn(
+          `[Discord] ${action} rate limited, retrying in ${waitMs}ms`,
+        );
         await new Promise((resolve) => setTimeout(resolve, waitMs));
         continue;
       }
-      throw new Error(`Failed to send message: ${error}`);
+      throw new Error(`Failed to ${action}: ${error}`);
     }
-    throw new Error("Failed to send message: exhausted Discord retries");
+    throw new Error(`Failed to ${action}: exhausted Discord retries`);
   }
 
   async editMessage(channelId: string, messageId: string, content: string): Promise<void> {
@@ -713,16 +771,26 @@ export class DiscordAdapter extends BaseAdapter {
     if (chunks.length === 0) {
       return;
     }
-    const response = await this.apiRequest(`/channels/${channelId}/messages/${messageId}`, {
-      method: "PATCH",
-      body: JSON.stringify({ content: chunks[0] }),
-    });
-    if (!response.ok) {
-      const error = await response.text();
-      throw new Error(`Failed to edit message: ${error}`);
-    }
+    await this.requestDiscordWithRetry(
+      `/channels/${channelId}/messages/${messageId}`,
+      {
+        method: "PATCH",
+        body: JSON.stringify({ content: chunks[0] }),
+      },
+      "edit message",
+    );
     for (const extra of chunks.slice(1)) {
-      await this.sendDiscordMessage(channelId, { content: extra });
+      try {
+        await this.sendDiscordMessage(channelId, { content: extra });
+      } catch (error) {
+        // The first chunk is already visible. Throwing here makes the caller
+        // resend the entire response and duplicate all delivered chunks.
+        logger.error(
+          "[Discord] Response was only partially delivered; not resending the prefix:",
+          error,
+        );
+        return;
+      }
     }
   }
 
@@ -741,16 +809,10 @@ export class DiscordAdapter extends BaseAdapter {
   }
 
   async getStatus(): Promise<{ connected: boolean; latency?: number }> {
-    try {
-      const response = await this.apiRequest("/gateway/bot");
-      const data: any = await response.json();
-      return {
-        connected: true,
-        latency: data.session_start_limit?.remaining ?? undefined,
-      };
-    } catch {
-      return { connected: false };
-    }
+    return {
+      connected:
+        this.running && this.wsConnection?.readyState === WebSocket.OPEN,
+    };
   }
 
   async stop(): Promise<void> {

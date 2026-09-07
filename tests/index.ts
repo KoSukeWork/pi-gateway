@@ -244,6 +244,7 @@ assert.equal(healthyReport.adapters, 1);
 assert.equal(healthyReport.agentConnected, true);
 
 const originalHome = process.env.HOME;
+const originalUserProfile = process.env.USERPROFILE;
 const originalSetInterval = globalThis.setInterval;
 const originalClearInterval = globalThis.clearInterval;
 const testHome = await mkdtemp(join(tmpdir(), "pi-gateway-status-"));
@@ -275,7 +276,8 @@ try {
 			tokens: ["example-token"],
 		}),
 	);
-	process.env.HOME = testHome;
+process.env.HOME = testHome;
+process.env.USERPROFILE = testHome;
 
 	const intervalToken = { unref() {} };
 	globalThis.setInterval = ((
@@ -377,8 +379,10 @@ try {
 } finally {
 	globalThis.setInterval = originalSetInterval;
 	globalThis.clearInterval = originalClearInterval;
-	if (originalHome === undefined) delete process.env.HOME;
-	else process.env.HOME = originalHome;
+if (originalHome === undefined) delete process.env.HOME;
+else process.env.HOME = originalHome;
+if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+else process.env.USERPROFILE = originalUserProfile;
 	await new Promise<void>((resolve) => healthServer.close(() => resolve()));
 	await rm(testHome, { recursive: true, force: true });
 }

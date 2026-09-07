@@ -1,1 +1,1 @@
-export { initBackgroundTasks, startBackgroundTask, getPendingResultsForSession, markTaskDelivered, listTasks, cancelTask, type BackgroundTask, type BackgroundStatus } from "./manager.js";
+export { closeBackgroundTasks, initBackgroundTasks, startBackgroundTask, getPendingResultsForSession, markTaskDelivered, listTasks, cancelTask, type BackgroundTask, type BackgroundStatus } from "./manager.js";

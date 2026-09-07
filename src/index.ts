@@ -42,6 +42,7 @@ import {
 import {
 	formatModelListText,
 	modelListUsesInlineButtons,
+	parseModelKey,
 	type CatalogModel,
 } from "./model-list.js";
 
@@ -52,6 +53,7 @@ import type {
 import { Type } from "@sinclair/typebox";
 
 import {
+	closeSessionStore,
 	initSessionStore,
 	getOrCreateSession,
 	listSessions,
@@ -104,6 +106,7 @@ import {
 	writeGatewayPidFile,
 } from "./status.js";
 import {
+	closeSecurityStore,
 	initSecurityStore,
 	isUserAllowed,
 	isAdmin,
@@ -127,6 +130,7 @@ import {
 	buildPolicyGuard,
 } from "./security/tool-policy.js";
 import {
+	closeBackgroundTasks,
 	initBackgroundTasks,
 	startBackgroundTask,
 	getPendingResultsForSession,
@@ -822,7 +826,7 @@ const adapterCallbacks: AdapterCallbacks = {
 						message.channelId,
 						resumeIndex,
 					);
-					if (!choice.ok) {
+					if (choice.ok === false) {
 						const sessions = listRecentSessions({
 							rpcSessionDir: join(GATEWAY_CONFIG_DIR, "rpc-sessions"),
 						});
@@ -830,7 +834,7 @@ const adapterCallbacks: AdapterCallbacks = {
 							choice = { ok: true, sessionFile: sessions[resumeIndex].sessionFile };
 						}
 					}
-					if (!choice.ok) {
+					if (choice.ok === false) {
 						if (adapter) await adapter.sendMessage(message.channelId, choice.error);
 						return;
 					}
@@ -925,7 +929,7 @@ const adapterCallbacks: AdapterCallbacks = {
 					return;
 				}
 				const resolved = resolveSessionCwd(sessionCommand.path);
-				if (!resolved.ok) {
+				if (resolved.ok === false) {
 					if (adapter) await adapter.sendMessage(message.channelId, resolved.error);
 					return;
 				}
@@ -1047,8 +1051,9 @@ const adapterCallbacks: AdapterCallbacks = {
 			// Handle callback from inline keyboard
 			if (modelCallback) {
 				const key = modelCallback[1].trim();
-				const [provider, modelId] = key.split("/");
-				if (!provider || !modelId) return;
+				const parsed = parseModelKey(key);
+				if (!parsed) return;
+				const { provider, modelId } = parsed;
 
 				// Only admins can actually switch models
 				if (!isAdmin(message.platform as Platform, message.userId)) {
@@ -1095,10 +1100,11 @@ const adapterCallbacks: AdapterCallbacks = {
 				return;
 			}
 
-			const arg = (modelMatch?.[1] || "").trim().toLowerCase();
+			const arg = (modelMatch?.[1] || "").trim();
+			const normalizedArg = arg.toLowerCase();
 
 			// /model (no args) or /model list → show available models
-			if (!arg || arg === "list") {
+			if (!arg || normalizedArg === "list") {
 				try {
 					const result = (await sendRpc("get_available_models")) as {
 						success: boolean;
@@ -1125,11 +1131,16 @@ const adapterCallbacks: AdapterCallbacks = {
 							platform: string;
 							sendModelPicker?: (
 								ch: string,
+								ownerUserId: string,
 								models: CatalogModel[],
 							) => Promise<string>;
 						};
 						if (adapter && discord.platform === "discord" && discord.sendModelPicker) {
-							await discord.sendModelPicker(message.channelId, models);
+							await discord.sendModelPicker(
+								message.channelId,
+								message.userId,
+								models,
+							);
 						} else if (
 							adapter &&
 							modelListUsesInlineButtons(adapter.platform) &&
@@ -1181,8 +1192,8 @@ const adapterCallbacks: AdapterCallbacks = {
 				return;
 			}
 
-			const [provider, modelId] = arg.split("/");
-			if (!provider || !modelId) {
+			const parsed = parseModelKey(arg);
+			if (!parsed) {
 				if (adapter) {
 					await adapter.sendMessage(
 						message.channelId,
@@ -1191,6 +1202,7 @@ const adapterCallbacks: AdapterCallbacks = {
 				}
 				return;
 			}
+			const { provider, modelId } = parsed;
 
 			try {
 				const result = (await sendRpc("set_model", {
@@ -1233,16 +1245,28 @@ const adapterCallbacks: AdapterCallbacks = {
 			if (!isAdmin(message.platform as Platform, message.userId)) {
 				// Non-admin: let pi handle it as a normal prompt
 			} else if (IS_DAEMON) {
-				// In daemon mode: restart the entire gateway
+				// Restart listeners, adapters, and the RPC child in-process. Sending
+				// SIGHUP to self terminates Node abruptly on Windows.
 				const adapter = state.adapters.get(message.platform);
 				if (adapter) {
 					await adapter.sendMessage(
 						message.channelId,
-						"♻️ Restarting gateway daemon…",
+						"♻️ Restarting gateway runtime…",
 					);
 				}
-				// Send SIGHUP to self for graceful restart
-				process.kill(process.pid, "SIGHUP");
+				try {
+					await restartDaemonRuntime();
+					logger.info(`[gateway] Admin ${message.userId} restarted gateway runtime`);
+				} catch (error) {
+					logger.error("[gateway] Failed to restart gateway runtime:", error);
+					const activeAdapter = state.adapters.get(message.platform);
+					if (activeAdapter) {
+						await activeAdapter.sendMessage(
+							message.channelId,
+							"❌ Gateway runtime restart failed. Check the daemon log.",
+						);
+					}
+				}
 				return;
 			} else {
 				const adapter = state.adapters.get(message.platform);
@@ -2827,6 +2851,9 @@ export default function (pi: ExtensionAPI) {
 		statusRefreshInterval = null;
 		lastGatewayStatusText = null;
 		globalCtx = null;
+		closeBackgroundTasks();
+		closeSecurityStore();
+		closeSessionStore();
 	});
 
 	logger.info("[pi-gateway] Hermes-style gateway extension loaded");
@@ -2874,6 +2901,33 @@ async function reloadDaemonConfig(): Promise<void> {
 			`Listener rebind failed and was rolled back: ${rebindError instanceof Error ? rebindError.message : String(rebindError)}`,
 		);
 	}
+}
+
+/** Restart daemon-owned resources without self-signalling (unsafe on Windows). */
+function restartDaemonRuntime(): Promise<void> {
+	const restart = async () => {
+		const previousConfig = config;
+		const nextConfig = loadConfig();
+		await stopGatewayServer();
+		config = nextConfig;
+		try {
+			await startGatewayServer(config.port);
+		} catch (restartError) {
+			await stopGatewayServer();
+			config = previousConfig;
+			try {
+				await startGatewayServer(config.port);
+			} catch (rollbackError) {
+				logger.error(
+					"[pi-gateway] Runtime restart rollback failed:",
+					rollbackError,
+				);
+			}
+			throw restartError;
+		}
+	};
+	configReloadQueue = configReloadQueue.then(restart, restart);
+	return configReloadQueue;
 }
 
 /** Watch ~/.pi/gateway/config.json for validated, serialized reloads. */

@@ -20,9 +20,14 @@ assert.deepEqual(splitDiscordContent(""), []);
 assert.deepEqual(splitDiscordContent("   "), []);
 assert.deepEqual(splitDiscordContent("short"), ["short"]);
 {
-	const parts = splitDiscordContent(`${"a".repeat(1500)}\n${"b".repeat(1500)}`);
-	assert.equal(parts.length, 2);
-	assert.ok(parts.every((part) => part.length <= DISCORD_CONTENT_MAX));
+const parts = splitDiscordContent(`${"a".repeat(1500)}\n${"b".repeat(1500)}`);
+assert.equal(parts.length, 2);
+assert.ok(parts.every((part) => part.length <= DISCORD_CONTENT_MAX));
+
+const indented = splitDiscordContent(
+	`${"a".repeat(1500)}\n    indented line ${"b".repeat(1000)}`,
+);
+assert.match(indented[1], /^    indented line/);
 	assert.equal(parts[0], "a".repeat(1500));
 	assert.equal(parts[1], "b".repeat(1500));
 }

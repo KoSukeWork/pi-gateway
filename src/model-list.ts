@@ -1,4 +1,8 @@
-import { truncateDiscordLabel } from "./adapters/discord-interactive.js";
+import {
+	truncateDiscordLabel,
+	type DiscordActionRow,
+	type DiscordButton,
+} from "./adapters/discord-interactive.js";
 
 export type CatalogModel = {
 	provider: string;
@@ -21,18 +25,14 @@ export function formatModelListText(models: CatalogModel[]): string {
 /** Discord string selects hold 25 options. Provider list and model list both page. */
 export const DISCORD_MODEL_PAGE_SIZE = 25;
 export const DISCORD_MODEL_PICKER_TTL_MS = 15 * 60 * 1000;
+export const DISCORD_MODEL_PICKER_MAX_ENTRIES = 500;
 export const DISCORD_MODEL_SELECT_ID = "modelsel";
 export const DISCORD_PROVIDER_SELECT_ID = "modelprov";
 export const DISCORD_MODEL_BACK_ID = "modelback";
 
-export type DiscordMessageComponent = {
-	type: 1;
-	components: Array<Record<string, unknown>>;
-};
-
 export type DiscordModelPickerMessage = {
 	content: string;
-	components: DiscordMessageComponent[];
+	components: DiscordActionRow[];
 };
 
 export type DiscordModelPickerView = {
@@ -43,13 +43,32 @@ export type DiscordModelPickerView = {
 type PickerEntry = {
 	models: CatalogModel[];
 	view: DiscordModelPickerView;
+	ownerUserId: string;
 	savedAt: number;
 };
 
 const discordModelPickers = new Map<string, PickerEntry>();
 
-export function discordModelPickerKey(channelId: string): string {
-	return `discord:${channelId}`;
+function pruneDiscordModelPickers(now: number): void {
+	for (const [key, entry] of discordModelPickers) {
+		if (now - entry.savedAt > DISCORD_MODEL_PICKER_TTL_MS) {
+			discordModelPickers.delete(key);
+		}
+	}
+	while (discordModelPickers.size >= DISCORD_MODEL_PICKER_MAX_ENTRIES) {
+		const oldestKey = discordModelPickers.keys().next().value as
+			| string
+			| undefined;
+		if (!oldestKey) break;
+		discordModelPickers.delete(oldestKey);
+	}
+}
+
+export function discordModelPickerKey(
+	channelId: string,
+	messageId: string,
+): string {
+	return `discord:${channelId}:${messageId}`;
 }
 
 export function listDiscordProviders(models: CatalogModel[]): string[] {
@@ -80,24 +99,30 @@ export function initialDiscordModelPickerView(
 
 export function rememberDiscordModelPicker(
 	channelId: string,
+	messageId: string,
+	ownerUserId: string,
 	models: CatalogModel[],
 	now = Date.now(),
 ): void {
-	discordModelPickers.set(discordModelPickerKey(channelId), {
+	pruneDiscordModelPickers(now);
+	discordModelPickers.set(discordModelPickerKey(channelId, messageId), {
 		models: models.slice(),
 		view: initialDiscordModelPickerView(models),
+		ownerUserId,
 		savedAt: now,
 	});
 }
 
 export function getDiscordModelPickerState(
 	channelId: string,
+	messageId: string,
 	now = Date.now(),
 ): PickerEntry | null {
-	const entry = discordModelPickers.get(discordModelPickerKey(channelId));
+	const key = discordModelPickerKey(channelId, messageId);
+	const entry = discordModelPickers.get(key);
 	if (!entry) return null;
 	if (now - entry.savedAt > DISCORD_MODEL_PICKER_TTL_MS) {
-		discordModelPickers.delete(discordModelPickerKey(channelId));
+		discordModelPickers.delete(key);
 		return null;
 	}
 	return entry;
@@ -105,16 +130,36 @@ export function getDiscordModelPickerState(
 
 export function updateDiscordModelPickerView(
 	channelId: string,
+	messageId: string,
 	view: DiscordModelPickerView,
 	now = Date.now(),
 ): PickerEntry | null {
-	const entry = getDiscordModelPickerState(channelId, now);
+	const entry = getDiscordModelPickerState(channelId, messageId, now);
 	if (!entry) return null;
 	entry.view = {
 		provider: view.provider,
 		page: Math.max(0, view.page),
 	};
 	return entry;
+}
+
+export function forgetDiscordModelPicker(
+	channelId: string,
+	messageId: string,
+): void {
+	discordModelPickers.delete(discordModelPickerKey(channelId, messageId));
+}
+
+export function parseModelKey(
+	input: string,
+): { provider: string; modelId: string } | null {
+	const key = input.trim();
+	const separator = key.indexOf("/");
+	if (separator <= 0 || separator === key.length - 1) return null;
+	return {
+		provider: key.slice(0, separator),
+		modelId: key.slice(separator + 1),
+	};
 }
 
 export function discordModelPageCount(total: number): number {
@@ -197,8 +242,8 @@ function pageButtons(
 	prefix: "modelpage" | "modelprovpage",
 	pageIndex: number,
 	pageCount: number,
-	extra: Record<string, unknown>[] = [],
-): DiscordMessageComponent {
+	extra: DiscordButton[] = [],
+): DiscordActionRow {
 	return {
 		type: 1,
 		components: [
@@ -244,7 +289,7 @@ function buildProviderPicker(
 		counts.set(model.provider, (counts.get(model.provider) ?? 0) + 1);
 	}
 
-	const components: DiscordMessageComponent[] = [];
+	const components: DiscordActionRow[] = [];
 	if (slice.length > 0) {
 		components.push({
 			type: 1,
@@ -301,7 +346,7 @@ function buildModelPicker(
 	const from = slice.length === 0 ? 0 : start + 1;
 	const to = start + slice.length;
 
-	const components: DiscordMessageComponent[] = [];
+	const components: DiscordActionRow[] = [];
 	if (slice.length > 0) {
 		components.push({
 			type: 1,
@@ -329,7 +374,7 @@ function buildModelPicker(
 		});
 	}
 
-	const back = showBack
+	const back: DiscordButton[] = showBack
 		? [
 				{
 					type: 2,

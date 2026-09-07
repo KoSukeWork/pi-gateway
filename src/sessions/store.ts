@@ -95,6 +95,13 @@ export function initSessionStore(): Database.Database {
 	return db;
 }
 
+/** Release the SQLite handle when the extension session shuts down. */
+export function closeSessionStore(): void {
+	if (!db) return;
+	db.close();
+	db = null;
+}
+
 /**
  * Generate unique session ID
  */
