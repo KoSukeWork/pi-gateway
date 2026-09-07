@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.16.6] - 2026-09-07
+
+### Changed
+- Discord `/model` now uses a provider dropdown, then a model dropdown (25 per page with Back/Prev/Next), instead of a wall of text.
+
 ## [1.16.5] - 2026-09-07
 
 ### Fixed

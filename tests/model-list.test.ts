@@ -1,7 +1,21 @@
 import assert from "node:assert/strict";
 import {
+	buildDiscordModelPicker,
+	DISCORD_MODEL_BACK_ID,
+	DISCORD_MODEL_PAGE_SIZE,
+	DISCORD_MODEL_PICKER_TTL_MS,
+	DISCORD_MODEL_SELECT_ID,
+	DISCORD_PROVIDER_SELECT_ID,
 	formatModelListText,
+	getDiscordModelPickerState,
+	initialDiscordModelPickerView,
+	listDiscordProviders,
 	modelListUsesInlineButtons,
+	parseDiscordModelPageCustomId,
+	parseDiscordProviderPageCustomId,
+	rememberDiscordModelPicker,
+	resolveDiscordModelSelection,
+	resolveDiscordProviderSelection,
 } from "../src/model-list.js";
 
 assert.equal(modelListUsesInlineButtons("telegram"), true);
@@ -14,6 +28,114 @@ const text = formatModelListText([
 ]);
 assert.match(text, /^Available models \(2\):/);
 assert.match(text, /Work\/grok-4\.6/);
-assert.match(text, /Work\/gpt-5/);
 assert.match(text, /\/model provider\/id/);
+
+const catalog = [
+	{ provider: "Work", id: "grok-4.6", name: "Grok 4.6" },
+	{ provider: "Work", id: "gpt-5", name: "GPT-5" },
+	{ provider: "OpenAI", id: "gpt-4.1", name: "GPT-4.1" },
+];
+assert.deepEqual(listDiscordProviders(catalog), ["Work", "OpenAI"]);
+assert.deepEqual(initialDiscordModelPickerView(catalog), {
+	provider: null,
+	page: 0,
+});
+assert.deepEqual(initialDiscordModelPickerView(catalog.slice(0, 2)), {
+	provider: "Work",
+	page: 0,
+});
+
+const providers = buildDiscordModelPicker(catalog, { provider: null, page: 0 });
+assert.match(providers.content, /across 2 providers/);
+assert.equal(providers.components.length, 1);
+assert.equal(providers.components[0].components[0].custom_id, DISCORD_PROVIDER_SELECT_ID);
+assert.equal(
+	(providers.components[0].components[0].options as unknown[]).length,
+	2,
+);
+assert.equal(
+	(providers.components[0].components[0].options as Array<{ value: string }>)[0]
+		.value,
+	"prov:Work",
+);
+
+const work = buildDiscordModelPicker(catalog, { provider: "Work", page: 0 });
+assert.match(work.content, /^Work models \(2\)/);
+assert.equal(work.components[0].components[0].custom_id, DISCORD_MODEL_SELECT_ID);
+assert.equal(work.components[1].components[0].custom_id, DISCORD_MODEL_BACK_ID);
+
+const single = buildDiscordModelPicker(catalog.slice(0, 2), {
+	provider: "Work",
+	page: 0,
+});
+assert.equal(
+	single.components.some((row) =>
+		row.components.some((c) => c.custom_id === DISCORD_MODEL_BACK_ID),
+	),
+	false,
+);
+
+const manyWork = Array.from({ length: 60 }, (_, i) => ({
+	provider: "Work",
+	id: `model-${i}`,
+	name: `Model ${i}`,
+}));
+const manyOpen = Array.from({ length: 3 }, (_, i) => ({
+	provider: "Other",
+	id: `o-${i}`,
+	name: `Other ${i}`,
+}));
+const paged = buildDiscordModelPicker([...manyWork, ...manyOpen], {
+	provider: "Work",
+	page: 1,
+});
+assert.match(paged.content, /Showing 26–50/);
+assert.equal(
+	(paged.components[0].components[0].options as unknown[]).length,
+	DISCORD_MODEL_PAGE_SIZE,
+);
+assert.equal(paged.components[1].components[0].custom_id, DISCORD_MODEL_BACK_ID);
+assert.equal(paged.components[1].components[3].disabled, false);
+
+const longId = "x".repeat(120);
+const longPicker = buildDiscordModelPicker(
+	[{ provider: "Work", id: longId, name: "Long" }],
+	{ provider: "Work", page: 0 },
+);
+assert.equal(
+	(longPicker.components[0].components[0].options as Array<{ value: string }>)[0]
+		.value,
+	"modelidx:0",
+);
+
+assert.equal(
+	resolveDiscordModelSelection("model:Work/grok-4.6", catalog),
+	"Work/grok-4.6",
+);
+assert.equal(
+	resolveDiscordProviderSelection("prov:OpenAI", ["Work", "OpenAI"]),
+	"OpenAI",
+);
+assert.equal(
+	resolveDiscordProviderSelection("providx:1", ["Work", "OpenAI"]),
+	"OpenAI",
+);
+
+assert.deepEqual(parseDiscordModelPageCustomId("modelpage:2"), {
+	page: 2,
+	stay: false,
+});
+assert.deepEqual(parseDiscordProviderPageCustomId("modelprovpage:stay:1"), {
+	page: 1,
+	stay: true,
+});
+
+rememberDiscordModelPicker("chan", catalog, 1000);
+const saved = getDiscordModelPickerState("chan", 1000);
+assert.equal(saved?.view.provider, null);
+assert.equal(
+	getDiscordModelPickerState("chan", 1000 + DISCORD_MODEL_PICKER_TTL_MS + 1),
+	null,
+);
+
 console.log("model-list tests passed");

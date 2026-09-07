@@ -42,6 +42,7 @@ import {
 import {
 	formatModelListText,
 	modelListUsesInlineButtons,
+	type CatalogModel,
 } from "./model-list.js";
 
 import type {
@@ -1120,7 +1121,16 @@ const adapterCallbacks: AdapterCallbacks = {
 								btns: Array<Array<{ text: string; data: string }>>,
 							) => Promise<string>;
 						};
-						if (
+						const discord = adapter as {
+							platform: string;
+							sendModelPicker?: (
+								ch: string,
+								models: CatalogModel[],
+							) => Promise<string>;
+						};
+						if (adapter && discord.platform === "discord" && discord.sendModelPicker) {
+							await discord.sendModelPicker(message.channelId, models);
+						} else if (
 							adapter &&
 							modelListUsesInlineButtons(adapter.platform) &&
 							telegram.sendButtons

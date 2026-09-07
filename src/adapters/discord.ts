@@ -33,6 +33,21 @@ import {
   discordReconnectDelayMs,
   isDiscordFatalClose,
 } from "./discord-gateway.js";
+import {
+  buildDiscordModelPicker,
+  DISCORD_MODEL_BACK_ID,
+  DISCORD_MODEL_SELECT_ID,
+  DISCORD_PROVIDER_SELECT_ID,
+  getDiscordModelPickerState,
+  listDiscordProviders,
+  parseDiscordModelPageCustomId,
+  parseDiscordProviderPageCustomId,
+  rememberDiscordModelPicker,
+  resolveDiscordModelSelection,
+  resolveDiscordProviderSelection,
+  updateDiscordModelPickerView,
+  type CatalogModel,
+} from "../model-list.js";
 
 export interface DiscordConfig extends PlatformConfig {
   platform: "discord";
@@ -421,29 +436,146 @@ export class DiscordAdapter extends BaseAdapter {
     await this.callbacks?.onMessage(message);
   }
 
-  private async handleComponentInteraction(data: any): Promise<void> {
-    const customId: string = data.data?.custom_id ?? "";
-    const parsed = parseDiscordButtonCustomId(customId);
-    const userId = data.member?.user?.id ?? data.user?.id;
-
+  private async ackInteraction(
+    data: any,
+    payload: { type: number; data?: Record<string, unknown> },
+  ): Promise<void> {
     try {
       await this.apiRequest(`/interactions/${data.id}/${data.token}/callback`, {
         method: "POST",
-        body: JSON.stringify({
-          type: 7,
-          data: { components: [] },
-        }),
+        body: JSON.stringify(payload),
       });
     } catch (error) {
-      logger.error("[Discord] Failed to acknowledge button interaction:", error);
+      logger.error("[Discord] Failed to acknowledge interaction:", error);
+    }
+  }
+
+  private async handleModelPickerInteraction(data: any): Promise<boolean> {
+    const customId: string = data.data?.custom_id ?? "";
+    const values: string[] = data.data?.values ?? [];
+    const channelId = data.channel_id as string | undefined;
+    if (!channelId) return false;
+
+    const expired = async () => {
+      await this.ackInteraction(data, {
+        type: 7,
+        data: {
+          content: "Model list expired. Run /model again.",
+          components: [],
+        },
+      });
+    };
+
+    if (customId === DISCORD_PROVIDER_SELECT_ID) {
+      const state = getDiscordModelPickerState(channelId);
+      if (!state) {
+        await expired();
+        return true;
+      }
+      const provider = resolveDiscordProviderSelection(
+        values[0] ?? "",
+        listDiscordProviders(state.models),
+      );
+      if (!provider) {
+        await this.ackInteraction(data, { type: 6 });
+        return true;
+      }
+      const next = updateDiscordModelPickerView(channelId, {
+        provider,
+        page: 0,
+      });
+      const payload = buildDiscordModelPicker(next?.models ?? state.models, next?.view ?? {
+        provider,
+        page: 0,
+      });
+      await this.ackInteraction(data, { type: 7, data: payload });
+      return true;
     }
 
-    if (parsed) {
-      this.callbacks?.onInteractiveResponse?.(parsed, userId);
-      return;
+    if (customId === DISCORD_MODEL_SELECT_ID) {
+      const state = getDiscordModelPickerState(channelId);
+      const key = resolveDiscordModelSelection(values[0] ?? "", state?.models ?? null);
+      await this.ackInteraction(data, {
+        type: 7,
+        data: {
+          content: key ? `Picked ${key}. Switching…` : "Could not resolve that model.",
+          components: [],
+        },
+      });
+      if (key) {
+        await this.emitCallback(data, `model:${key}`);
+      }
+      return true;
     }
+
+    if (customId === DISCORD_MODEL_BACK_ID) {
+      const state = getDiscordModelPickerState(channelId);
+      if (!state) {
+        await expired();
+        return true;
+      }
+      const next = updateDiscordModelPickerView(channelId, {
+        provider: null,
+        page: 0,
+      });
+      const payload = buildDiscordModelPicker(next?.models ?? state.models, {
+        provider: null,
+        page: 0,
+      });
+      await this.ackInteraction(data, { type: 7, data: payload });
+      return true;
+    }
+
+    const modelPage = parseDiscordModelPageCustomId(customId);
+    if (modelPage) {
+      if (modelPage.stay) {
+        await this.ackInteraction(data, { type: 6 });
+        return true;
+      }
+      const state = getDiscordModelPickerState(channelId);
+      if (!state?.view.provider) {
+        await expired();
+        return true;
+      }
+      const next = updateDiscordModelPickerView(channelId, {
+        provider: state.view.provider,
+        page: modelPage.page,
+      });
+      const payload = buildDiscordModelPicker(next?.models ?? state.models, next?.view ?? state.view);
+      await this.ackInteraction(data, { type: 7, data: payload });
+      return true;
+    }
+
+    const providerPage = parseDiscordProviderPageCustomId(customId);
+    if (providerPage) {
+      if (providerPage.stay) {
+        await this.ackInteraction(data, { type: 6 });
+        return true;
+      }
+      const state = getDiscordModelPickerState(channelId);
+      if (!state) {
+        await expired();
+        return true;
+      }
+      const next = updateDiscordModelPickerView(channelId, {
+        provider: null,
+        page: providerPage.page,
+      });
+      const payload = buildDiscordModelPicker(next?.models ?? state.models, {
+        provider: null,
+        page: providerPage.page,
+      });
+      await this.ackInteraction(data, { type: 7, data: payload });
+      return true;
+    }
+
+    return false;
+  }
+
+  private async emitCallback(data: any, customId: string): Promise<void> {
+    const userId = data.member?.user?.id ?? data.user?.id;
     const channelId = data.channel_id;
-    if (!userId || !channelId || !customId) {
+    if (!userId || !channelId) {
       logger.warn(`[Discord] Unknown interactive custom_id: ${customId}`);
       return;
     }
@@ -460,6 +592,22 @@ export class DiscordAdapter extends BaseAdapter {
         callback: true,
       },
     });
+  }
+
+  private async handleComponentInteraction(data: any): Promise<void> {
+    if (await this.handleModelPickerInteraction(data)) return;
+
+    const customId: string = data.data?.custom_id ?? "";
+    const parsed = parseDiscordButtonCustomId(customId);
+    const userId = data.member?.user?.id ?? data.user?.id;
+
+    await this.ackInteraction(data, { type: 7, data: { components: [] } });
+
+    if (parsed) {
+      this.callbacks?.onInteractiveResponse?.(parsed, userId);
+      return;
+    }
+    await this.emitCallback(data, customId);
   }
 
   async sendInteractive(
@@ -522,6 +670,16 @@ export class DiscordAdapter extends BaseAdapter {
       content: truncateDiscordContent(text),
       components,
     });
+  }
+
+  async sendModelPicker(channelId: string, models: CatalogModel[]): Promise<string> {
+    rememberDiscordModelPicker(channelId, models);
+    const state = getDiscordModelPickerState(channelId);
+    const payload = buildDiscordModelPicker(
+      state?.models ?? models,
+      state?.view,
+    );
+    return this.sendDiscordMessage(channelId, payload);
   }
 
   private async sendDiscordMessage(
