@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.16.5] - 2026-09-07
+
+### Fixed
+- Discord Gateway now resumes sessions, honors opcode 7/9, ACKs heartbeats, and clears heartbeat timers on reconnect so the bot does not drop hourly.
+
 ## [1.16.4] - 2026-09-06
 
 ### Fixed

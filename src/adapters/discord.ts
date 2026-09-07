@@ -25,6 +25,14 @@ import {
   truncateDiscordContent,
   truncateDiscordLabel,
 } from "./discord-interactive.js";
+import {
+  buildDiscordHeartbeat,
+  buildDiscordIdentify,
+  buildDiscordResume,
+  canResumeDiscordSession,
+  discordReconnectDelayMs,
+  isDiscordFatalClose,
+} from "./discord-gateway.js";
 
 export interface DiscordConfig extends PlatformConfig {
   platform: "discord";
@@ -57,6 +65,11 @@ export class DiscordAdapter extends BaseAdapter {
   private botUserId: string | null = null;
   private applicationId: string | null = null;
   private intents: number = 0;
+  private heartbeatAcked = true;
+  private heartbeatTimeout: ReturnType<typeof setTimeout> | null = null;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconnectAttempt = 0;
+  private lastCloseCode: number | null = null;
 
   constructor(config: DiscordConfig) {
     super();
@@ -90,8 +103,14 @@ export class DiscordAdapter extends BaseAdapter {
 
   async start(callbacks): Promise<void> {
     await super.start(callbacks);
+    await this.connectGateway();
+  }
 
-    // Connect to Gateway
+  private async connectGateway(): Promise<void> {
+    if (!this.running) return;
+    this.clearReconnectTimer();
+    this.teardownSocket();
+
     const gatewayResponse = await this.apiRequest("/gateway");
     const gatewayData = (await gatewayResponse.json()) as { url: string };
     const gatewayUrl = `${gatewayData.url}?v=10&encoding=json&intents=${this.intents}`;
@@ -107,11 +126,33 @@ export class DiscordAdapter extends BaseAdapter {
       await this.handleGatewayMessage(data);
     };
 
-    this.wsConnection.onclose = () => {
-      logger.info("[Discord] WebSocket closed");
+    this.wsConnection.onerror = (err) => {
+      logger.error("[Discord] WebSocket error:", err);
+    };
+
+    this.wsConnection.onclose = (event) => {
+      logger.info(
+        `[Discord] WebSocket closed code=${event.code} reason=${event.reason || ""}`,
+      );
       this.callbacks?.onDisconnect?.();
-      // Attempt reconnect after 5 seconds
-      setTimeout(() => this.start(callbacks), 5000);
+      this.lastCloseCode = event.code;
+      if (isDiscordFatalClose(event.code)) {
+        logger.error("[Discord] Fatal gateway close — not reconnecting");
+        this.sessionId = null;
+        this.sequence = null;
+        return;
+      }
+      if (
+        !canResumeDiscordSession({
+          sessionId: this.sessionId,
+          sequence: this.sequence,
+          closeCode: event.code,
+        })
+      ) {
+        this.sessionId = null;
+        this.sequence = null;
+      }
+      this.scheduleReconnect(`ws close ${event.code}`);
     };
   }
 
@@ -121,44 +162,147 @@ export class DiscordAdapter extends BaseAdapter {
         this.sequence = data.s;
         await this.handleDispatch(data.t, data.d);
         break;
-        
+
+      case 1: // Heartbeat request
+        this.sendHeartbeat(true);
+        break;
+
+      case 7: // Reconnect
+        logger.info("[Discord] Opcode 7 reconnect requested");
+        this.scheduleReconnect("opcode 7");
+        break;
+
+      case 9: { // Invalid Session
+        const resumable = data.d === true;
+        logger.warn(`[Discord] Invalid session resumable=${resumable}`);
+        if (
+          !canResumeDiscordSession({
+            sessionId: this.sessionId,
+            sequence: this.sequence,
+            invalidSessionResumable: resumable,
+          })
+        ) {
+          this.sessionId = null;
+          this.sequence = null;
+        }
+        this.scheduleReconnect("invalid session");
+        break;
+      }
+
       case 10: // Hello
         this.startHeartbeat(data.d.heartbeat_interval);
-        this.identify();
+        if (
+          canResumeDiscordSession({
+            sessionId: this.sessionId,
+            sequence: this.sequence,
+            closeCode: this.lastCloseCode,
+          })
+        ) {
+          this.resume();
+        } else {
+          this.identify();
+        }
         break;
-        
+
       case 11: // Heartbeat ACK
-        // Heartbeat acknowledged
+        this.heartbeatAcked = true;
         break;
     }
   }
 
   private startHeartbeat(interval: number): void {
-    this.heartbeatInterval = setInterval(() => {
-      if (this.wsConnection?.readyState === WebSocket.OPEN) {
-        this.wsConnection.send(JSON.stringify({
-          op: 1,
-          d: this.sequence,
-        }));
-      }
-    }, interval);
+    this.clearHeartbeat();
+    this.heartbeatAcked = true;
+    const delay = Math.max(0, interval * Math.random());
+    this.heartbeatTimeout = setTimeout(() => {
+      this.heartbeatTimeout = null;
+      this.sendHeartbeat();
+      this.heartbeatInterval = setInterval(() => this.sendHeartbeat(), interval);
+    }, delay);
   }
 
-  private async identify(): Promise<void> {
-    const identifyPayload = {
-      op: 2,
-      d: {
-        token: this.config.botToken,
-        intents: this.intents,
-        properties: {
-          os: "linux",
-          browser: "pi-gateway",
-          device: "pi-gateway",
-        },
-      },
-    };
-    
-    this.wsConnection?.send(JSON.stringify(identifyPayload));
+  private sendHeartbeat(force = false): void {
+    if (!this.running) return;
+    if (!force && !this.heartbeatAcked) {
+      logger.warn("[Discord] Heartbeat ACK missing — reconnecting");
+      this.scheduleReconnect("missing heartbeat ack");
+      return;
+    }
+    if (this.wsConnection?.readyState !== WebSocket.OPEN) return;
+    this.heartbeatAcked = false;
+    this.wsConnection.send(JSON.stringify(buildDiscordHeartbeat(this.sequence)));
+  }
+
+  private identify(): void {
+    this.wsConnection?.send(
+      JSON.stringify(buildDiscordIdentify(this.config.botToken, this.intents)),
+    );
+  }
+
+  private resume(): void {
+    if (!this.sessionId) {
+      this.identify();
+      return;
+    }
+    logger.info("[Discord] Resuming gateway session");
+    this.wsConnection?.send(
+      JSON.stringify(
+        buildDiscordResume(this.config.botToken, this.sessionId, this.sequence),
+      ),
+    );
+  }
+
+  private scheduleReconnect(reason: string): void {
+    if (!this.running) return;
+    if (this.reconnectTimer) return;
+    this.teardownSocket();
+    const delay = discordReconnectDelayMs(this.reconnectAttempt++);
+    logger.info(
+      `[Discord] Reconnecting in ${delay}ms (${reason}, attempt ${this.reconnectAttempt})`,
+    );
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      void this.connectGateway().catch((err) => {
+        logger.error("[Discord] Reconnect failed:", err);
+        this.scheduleReconnect("connect failed");
+      });
+    }, delay);
+  }
+
+  private teardownSocket(): void {
+    this.clearHeartbeat();
+    const ws = this.wsConnection;
+    this.wsConnection = null;
+    if (!ws) return;
+    ws.onclose = null;
+    ws.onerror = null;
+    ws.onmessage = null;
+    ws.onopen = null;
+    if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+      try {
+        ws.close(1000, "adapter stop");
+      } catch {
+        /* already closing */
+      }
+    }
+  }
+
+  private clearHeartbeat(): void {
+    if (this.heartbeatTimeout) {
+      clearTimeout(this.heartbeatTimeout);
+      this.heartbeatTimeout = null;
+    }
+    if (this.heartbeatInterval) {
+      clearInterval(this.heartbeatInterval);
+      this.heartbeatInterval = null;
+    }
+  }
+
+  private clearReconnectTimer(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
   }
 
   private async handleDispatch(type: string, data: any): Promise<void> {
@@ -167,8 +311,16 @@ export class DiscordAdapter extends BaseAdapter {
         this.sessionId = data.session_id;
         this.botUserId = data.user?.id ?? null;
         this.applicationId = data.application?.id ?? data.user?.id ?? null;
+        this.reconnectAttempt = 0;
+        this.lastCloseCode = null;
         logger.info(`[Discord] Logged in as ${data.user.username}`);
         await this.registerDefaultSlashCommands();
+        break;
+
+      case "RESUMED":
+        this.reconnectAttempt = 0;
+        this.lastCloseCode = null;
+        logger.info("[Discord] Session resumed");
         break;
 
       case "MESSAGE_CREATE":
@@ -444,13 +596,9 @@ export class DiscordAdapter extends BaseAdapter {
   }
 
   async stop(): Promise<void> {
-    if (this.heartbeatInterval) {
-      clearInterval(this.heartbeatInterval);
-    }
-    if (this.wsConnection) {
-      this.wsConnection.close();
-    }
     await super.stop();
+    this.clearReconnectTimer();
+    this.teardownSocket();
   }
 
   // Helper to register slash commands
