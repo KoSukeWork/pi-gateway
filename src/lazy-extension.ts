@@ -94,9 +94,11 @@ function filterStaticCompletions(
 	return hits.length > 0 ? hits : null;
 }
 
+type RegistrationState = { phase: "installing" | "replaying" | "live" | "failed" };
+
 function wrapRuntimePi(
 	pi: ExtensionAPI,
-	pending: Map<string, { event: unknown; ctx: unknown }>,
+	state: RegistrationState,
 	realCommands: Map<string, CommandHandler>,
 	realCompletions: Map<string, CompletionsFn>,
 	replayHandlers: Map<string, Array<(event: unknown, ctx: unknown) => unknown>>,
@@ -104,12 +106,17 @@ function wrapRuntimePi(
 	origOn: (event: string, handler: (event: unknown, ctx: unknown) => unknown) => void,
 ): ExtensionAPI {
 	const origRegisterCommand = pi.registerCommand.bind(pi);
+	const register = (commit: () => void) => {
+		if (state.phase === "installing") commitQueue.push(commit);
+		else if (state.phase !== "failed") commit();
+	};
 	return new Proxy(pi, {
 		get(target, prop, receiver) {
 			if (prop === "on") {
 				return (event: string, handler: (event: unknown, ctx: unknown) => unknown) => {
-					if (!(REPLAY_EVENTS as readonly string[]).includes(event)) {
-						commitQueue.push(() => origOn(event as never, handler as never));
+					if (state.phase === "failed") return;
+					if (state.phase === "live" || !(REPLAY_EVENTS as readonly string[]).includes(event)) {
+						register(() => origOn(event as never, handler as never));
 						return;
 					}
 					// Replay handlers stay uncommitted until the pending event has been
@@ -129,7 +136,7 @@ function wrapRuntimePi(
 						getArgumentCompletions?: CompletionsFn;
 					},
 				) => {
-					commitQueue.push(() => {
+					register(() => {
 						origRegisterCommand(name, options as never);
 						realCommands.set(name, options.handler);
 						if (typeof options.getArgumentCompletions === "function") {
@@ -157,7 +164,8 @@ export function installDeferred(
 	const replayHandlers = new Map<string, Array<(event: unknown, ctx: unknown) => unknown>>();
 	const commitQueue: Array<() => void> = [];
 	const origOn = pi.on.bind(pi) as (event: string, handler: (event: unknown, ctx: unknown) => unknown) => void;
-	const runtimePi = wrapRuntimePi(pi, pending, realCommands, realCompletions, replayHandlers, commitQueue, origOn);
+	const registration: RegistrationState = { phase: "installing" };
+	const runtimePi = wrapRuntimePi(pi, registration, realCommands, realCompletions, replayHandlers, commitQueue, origOn);
 	let ready: Promise<unknown> | undefined;
 	let warmupTimer: ReturnType<typeof setTimeout> | undefined;
 
@@ -188,7 +196,8 @@ export function installDeferred(
 						}
 						throw error;
 					}
-					for (const commit of commitQueue) {
+					registration.phase = "replaying";
+					for (const commit of commitQueue.splice(0)) {
 						commit();
 					}
 					for (const [event, handlers] of replayHandlers) {
@@ -216,11 +225,20 @@ export function installDeferred(
 							origOn(event as never, handler as never);
 						}
 					}
+					registration.phase = "live";
+					replayHandlers.clear();
+					pending.clear();
 					tryRefreshAutocomplete(pi);
 					return result;
 				});
 			ready = attempt;
 			void attempt.catch((error) => {
+				if (factoryStarted) {
+					registration.phase = "failed";
+					commitQueue.length = 0;
+					replayHandlers.clear();
+					pending.clear();
+				}
 				if (ready === attempt && !factoryStarted) ready = undefined;
 				const message = error instanceof Error ? error.stack ?? error.message : String(error);
 				console.error(`[pi-lazy-extension] deferred install failed: ${message}`);
@@ -253,6 +271,7 @@ export function installDeferred(
 
 	for (const event of REPLAY_EVENTS) {
 		on(event, (e, ctx) => {
+			if (registration.phase === "live" || registration.phase === "failed") return;
 			pending.set(event, { event: e, ctx });
 			if (event === "session_start") {
 				clearTimeout(warmupTimer);

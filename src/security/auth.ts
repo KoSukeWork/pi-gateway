@@ -48,7 +48,7 @@ interface PairingCode {
 	userId: string;
 	createdAt: number;
 	expiresAt: number;
-	used: boolean;
+	used: number;
 }
 
 interface RateLimitEntry {
@@ -172,35 +172,42 @@ export function generatePairingCode(
  */
 export function approvePairingCode(code: string): boolean {
 	const database = initSecurityStore();
+	return database.transaction(() => {
+		const entry = database
+			.prepare(`
+			SELECT code, platform, user_id AS userId, created_at AS createdAt,
+			       expires_at AS expiresAt, used
+			FROM pairing_codes WHERE code = ? AND used = 0 AND expires_at > ?
+		`)
+			.get(code, Date.now()) as PairingCode | undefined;
 
-	const entry = database
-		.prepare(`
-		SELECT * FROM pairing_codes WHERE code = ? AND used = 0 AND expires_at > ?
-	`)
-		.get(code, Date.now()) as PairingCode | undefined;
+		if (!entry) {
+			logger.info(`[Security] Pairing code ${code} not found or expired`);
+			return false;
+		}
 
-	if (!entry) {
-		logger.info(`[Security] Pairing code ${code} not found or expired`);
-		return false;
-	}
+		// Add to allowlist
+		database
+			.prepare(
+				`
+			INSERT INTO allowlist (platform, user_id, added_at)
+			VALUES (?, ?, ?)
+			ON CONFLICT(platform, user_id) DO NOTHING
+		`,
+			)
+			.run(entry.platform, entry.userId, Date.now());
+		if (!database.prepare("SELECT 1 FROM allowlist WHERE platform = ? AND user_id = ?").get(entry.platform, entry.userId)) {
+			throw new Error("Pairing authorization was not stored");
+		}
 
-	// Add to allowlist
-	database
-		.prepare(
-			`
-		INSERT OR IGNORE INTO allowlist (platform, user_id, added_at)
-		VALUES (?, ?, ?)
-	`,
-		)
-		.run(entry.platform, entry.userId, Date.now());
+		// Mark code as used
+		database
+			.prepare("UPDATE pairing_codes SET used = 1 WHERE code = ?")
+			.run(code);
 
-	// Mark code as used
-	database
-		.prepare("UPDATE pairing_codes SET used = 1 WHERE code = ?")
-		.run(code);
-
-	logger.info(`[Security] Approved pairing: ${entry.platform}/${entry.userId}`);
-	return true;
+		logger.info(`[Security] Approved pairing: ${entry.platform}/${entry.userId}`);
+		return true;
+	}).immediate();
 }
 
 /**
@@ -218,7 +225,9 @@ export function listPendingPairingCodes(): Array<{
 
 	const rows = database
 		.prepare(`
-		SELECT * FROM pairing_codes WHERE used = 0 AND expires_at > ?
+		SELECT code, platform, user_id AS userId, created_at AS createdAt,
+		       expires_at AS expiresAt, used
+		FROM pairing_codes WHERE used = 0 AND expires_at > ?
 		ORDER BY created_at ASC
 	`)
 		.all(now) as PairingCode[];
@@ -298,8 +307,8 @@ export function listAllowlistedUsers(platform?: Platform): AllowlistEntry[] {
 	const database = initSecurityStore();
 
 	const query = platform
-		? "SELECT * FROM allowlist WHERE platform = ? ORDER BY added_at DESC"
-		: "SELECT * FROM allowlist ORDER BY platform, added_at DESC";
+		? "SELECT platform, user_id AS userId, added_at AS addedAt, note FROM allowlist WHERE platform = ? ORDER BY added_at DESC"
+		: "SELECT platform, user_id AS userId, added_at AS addedAt, note FROM allowlist ORDER BY platform, added_at DESC";
 
 	const rows = platform
 		? (database.prepare(query).all(platform) as AllowlistEntry[])
@@ -321,11 +330,11 @@ export function checkRateLimit(
 
 	const entry = database
 		.prepare(`
-		SELECT * FROM rate_limits WHERE identifier = ?
+		SELECT identifier, count, window_start AS windowStart FROM rate_limits WHERE identifier = ?
 	`)
 		.get(identifier) as RateLimitEntry | undefined;
 
-	if (!entry || now - entry.windowStart > windowMs) {
+	if (!entry || now - entry.windowStart >= windowMs) {
 		// New window
 		database
 			.prepare(
@@ -460,7 +469,7 @@ export function removeAdmin(platform: Platform | "*", userId: string): boolean {
 export function listAdmins(): AdminEntry[] {
 	const database = initSecurityStore();
 	const rows = database
-		.prepare("SELECT * FROM admins ORDER BY platform, user_id")
+		.prepare("SELECT platform, user_id AS userId, added_at AS addedAt, note FROM admins ORDER BY platform, user_id")
 		.all() as AdminEntry[];
 	return rows;
 }

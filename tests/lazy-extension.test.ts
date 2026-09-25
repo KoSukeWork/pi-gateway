@@ -6,7 +6,6 @@ import { BLOCKING_EVENTS, REPLAY_EVENTS, STARTUP_EVENTS, installDeferred } from 
 const register = test;
 
 type InstallArgs = Parameters<typeof installDeferred>;
-type InstallOptions = InstallArgs[2];
 type DeferredPi = InstallArgs[0];
 type DeferredLoad = InstallArgs[1];
 type Handler = (event: unknown, ctx: unknown) => unknown;
@@ -535,4 +534,35 @@ register("real bootstrap declares matching capabilities and loads the real facto
 	// capability repos) has joined the stub: 2 handlers when declared, else 0.
 	const rdHandlers = (handlers.get("resources_discover") ?? []).length;
 	assert.strictEqual(rdHandlers, 0);
+});
+
+register("registrations during replay and after readiness reach the host exactly once", async () => {
+	const { pi, commands, emit } = createFakePi();
+	let runtime: DeferredPi | undefined;
+	let lateEvents = 0;
+	let replayEvents = 0;
+	let lateStarts = 0;
+	installDeferred(pi, async () => ({ default: (api) => {
+		runtime = api;
+		api.on("session_start", () => {
+			api.registerCommand("from-replay", { handler: async () => {} });
+			api.on("turn_start", () => { replayEvents++; });
+		});
+	} }));
+	await emit("session_start");
+	await emit("before_agent_start");
+	assert.ok(commands.has("from-replay"));
+	assert.ok(runtime);
+	runtime.registerCommand("late", { handler: async () => {} });
+	runtime.on("turn_end", () => { lateEvents++; });
+	runtime.on("session_start", () => { lateStarts++; });
+	assert.ok(commands.has("late"));
+	assert.equal(lateStarts, 0, "late handlers must not replay an old session");
+	await emit("turn_start");
+	await emit("turn_end");
+	assert.equal(replayEvents, 1);
+	assert.equal(lateEvents, 1);
+	await emit("session_start");
+	assert.equal(lateStarts, 1);
+	await emit("session_shutdown");
 });
