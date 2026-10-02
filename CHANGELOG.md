@@ -13,6 +13,9 @@ All notable changes to this project will be documented in this file.
 - Back default channel conversations with distinct persistent Pi session files, restore their history when switching channels, and give `/new` a fresh history.
 
 ### Fixed
+- Queue owner follow-ups arriving during final delivery for a new turn instead of acknowledging and discarding them. Cancel that queue explicitly on stop, and do not misreport accepted steering as failed when its acknowledgement cannot be delivered.
+- Wait for the modern RPC `agent_settled` boundary across retries, compaction and continuations; preserve legacy terminal handling, recognize current compaction events, and settle extension-handled prompts that never start the model. Forward explicitly displayed custom messages while excluding hidden context.
+- Drain stdout through child-process `close`, including an unterminated final event; route text replies to their referenced dialog and remain waiting while another dialog is open. Do not resend an already delivered complete attachment when placeholder cleanup fails.
 - Preserve full streamed text on empty/suffix-only terminal events, display model output-limit warnings, and retain complete extension display content even when widgets are cleared. Route editor-text events instead of dropping them.
 - Complete attachment fallbacks through the deferred Discord original response. Prefer full text attachments above eight chunks; fall back to complete text when attachment permission is unavailable, and retry explicitly rejected reply references without their anchor.
 - Preserve input whitespace and long permission context, accept pending answers without another mention, prevent prompts after cancellation during context delivery, and enforce channel/role restrictions for slash and component entry points.

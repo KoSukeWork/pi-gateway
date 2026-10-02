@@ -98,11 +98,11 @@ export class ChatReply {
 		} else if (event.type === "tool_execution_end") {
 			this.tools.delete(String(event.toolCallId ?? event.toolName));
 			this.phase = this.tools.size ? "🔧 正在执行工具…" : "⏳ 正在思考…";
-		} else if (event.type === "auto_compaction_start") {
+		} else if (event.type === "auto_compaction_start" || event.type === "compaction_start") {
 			this.phase = "📚 正在整理上下文…";
-		} else if (event.type === "auto_retry_start") {
+		} else if (event.type === "auto_retry_start" || event.type === "summarization_retry_scheduled") {
 			this.phase = "🔄 正在重试…";
-		} else if (event.type === "auto_compaction_end" || event.type === "auto_retry_end") {
+		} else if (event.type === "auto_compaction_end" || event.type === "compaction_end" || event.type === "auto_retry_end" || event.type === "summarization_retry_finished") {
 			this.phase = "⏳ 正在思考…";
 		} else if (event.type === "extension_ui_request" && event.method === "setStatus") {
 			const key = `status:${String(event.statusKey ?? "status")}`;

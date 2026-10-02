@@ -316,6 +316,8 @@ interface PendingCompletion {
 	streamedText: string;
 	stream: AssistantStream;
 	onEvent?: (event: Record<string, any>) => void;
+	agentEnd?: Record<string, any>;
+	agentStarted?: boolean;
 }
 const pendingCompletions: PendingCompletion[] = [];
 let rpcTurnActive = false;
@@ -325,11 +327,31 @@ let activeChatTurn: {
 	reply?: ChatReply;
 	stopping: boolean;
 	queued: string[];
+	phase: "preparing" | "running" | "delivering";
+	deferred: PlatformMessage[];
 } | null = null;
 
 function clearCompletionTimer(completion: PendingCompletion): void {
 	if (completion.timer) clearInterval(completion.timer);
 	completion.timer = null;
+}
+
+function settleRpcTurn(event: Record<string, any>): void {
+	rpcTurnActive = false;
+	const active = getActiveChannel();
+	const completion = pendingCompletions.shift();
+	const text = completion?.stream.finalText(event) ?? agentEndText(event);
+	if (completion) {
+		const error = agentEndError(event);
+		if (error) { completion.onStream?.(text); completion.reject(new Error(error)); }
+		else completion.resolve(text);
+	} else if (text.trim() && active) {
+		state.adapters.get(active.platform)?.sendMessage(active.channelId, text).catch((error) => {
+			logger.error("[gateway] Failed to deliver orphan terminal event:", error);
+		});
+	}
+	cleanupPendingUiRequests();
+	setActiveChannel(null);
 }
 
 function rejectPendingRpc(error: Error): void {
@@ -498,101 +520,86 @@ function createRpcProcess(): any {
 		}
 	});
 
+	function handleRpcLine(line: string): void {
+		if (!line) return;
+		try {
+			const msg = JSON.parse(line);
+			pendingCompletions[0]?.onEvent?.(msg);
+			if (msg.type === "agent_start") {
+				rpcTurnActive = true;
+				if (pendingCompletions[0]) pendingCompletions[0].agentStarted = true;
+			}
+
+			if (msg.id) {
+				const idx = pendingRequests.findIndex((r) => r.id === msg.id);
+				if (idx !== -1) {
+					const req = pendingRequests.splice(idx, 1)[0];
+					clearTimeout(req.timer);
+					req.resolve(msg);
+				}
+			}
+
+			// Modern Pi may retry/compact/continue after agent_end. Hold ownership until agent_settled.
+			if (msg.type === "agent_end") {
+				if (pendingCompletions[0]) pendingCompletions[0].agentEnd = msg;
+				// Older RPC protocols do not emit the willRetry/agent_settled pair.
+				if (typeof msg.willRetry !== "boolean") settleRpcTurn(msg);
+			} else if (msg.type === "agent_settled") {
+				settleRpcTurn(pendingCompletions[0]?.agentEnd ?? { messages: [] });
+			}
+
+			// Handle extension UI requests (select, confirm, input, etc.)
+			if (msg.type === "extension_ui_request") {
+				const active = getActiveChannel();
+				const adapter = active
+					? state.adapters.get(active.platform)
+					: undefined;
+				if (adapter) {
+					// Desktop footer/composer updates belong in the live reply, not separate chat messages.
+					if (!pendingCompletions[0]?.onEvent || !["setStatus", "setWidget", "setTitle"].includes(msg.method)) handleExtensionUiRequest(msg, adapter).catch((err) => {
+						logger.error(
+							"[gateway] Failed to handle extension UI request:",
+							err,
+						);
+						if (isDialogUiMethod(msg.method)) {
+							cancelUiRequest(msg.id);
+						}
+					});
+				} else if (isDialogUiMethod(msg.method)) {
+					logger.warn(
+						"[gateway] No adapter for extension UI request — cancelling so Pi cannot hang",
+					);
+					cancelUiRequest(msg.id);
+				}
+			}
+
+			// Stream text deltas to active completion
+			const completion = pendingCompletions[0];
+			const streamed = completion?.stream.consume(msg);
+			if (completion && streamed !== null && streamed !== undefined) {
+				completion.streamedText = streamed;
+				completion.onStream?.(streamed);
+			}
+
+			// Broadcast events
+			if (msg.type === "response") {
+				broadcastClients("response", msg);
+			} else {
+				broadcastClients("event", msg);
+			}
+		} catch {
+			logger.warn("[gateway] Failed to parse RPC line:", line.slice(0, 200));
+		}
+	}
+
 	const stdoutDecoder = new TextDecoder();
 	let lineBuffer = "";
 	proc.stdout?.on("data", (data: Buffer) => {
 		if (rpcProcess !== proc) return;
 		lineBuffer += stdoutDecoder.decode(data, { stream: true });
 		const lines = lineBuffer.split("\n");
-		// Keep the last (possibly incomplete) chunk in the buffer
 		lineBuffer = lines.pop() || "";
-
-		for (const line of lines) {
-			if (!line) continue;
-			try {
-				const msg = JSON.parse(line);
-				pendingCompletions[0]?.onEvent?.(msg);
-				if (msg.type === "agent_start") rpcTurnActive = true;
-
-				if (msg.id) {
-					const idx = pendingRequests.findIndex((r) => r.id === msg.id);
-					if (idx !== -1) {
-						const req = pendingRequests.splice(idx, 1)[0];
-						clearTimeout(req.timer);
-						req.resolve(msg);
-					}
-				}
-
-				// agent_end carries the full response — resolve pending completions
-				if (msg.type === "agent_end") {
-					const text = agentEndText(msg, pendingCompletions[0]?.stream.text);
-					logger.info(
-						`[gateway] agent_end received, text length: ${text.length}`,
-					);
-					rpcTurnActive = false;
-					const active = getActiveChannel();
-					const completion = pendingCompletions.shift();
-					if (completion) {
-						const error = agentEndError(msg);
-						if (error) completion.reject(new Error(error));
-						else completion.resolve(text);
-					} else if (text.trim() && active) {
-						const lateAdapter = state.adapters.get(active.platform);
-						logger.warn(
-							`[gateway] Orphan agent_end — delivering ${text.length} chars to ${active.platform}/${active.channelId}`,
-						);
-						lateAdapter?.sendMessage(active.channelId, text).catch((error) => {
-							logger.error("[gateway] Failed to deliver orphan agent_end:", error);
-						});
-					}
-					// Clean up any pending interactive prompts
-					cleanupPendingUiRequests();
-					setActiveChannel(null);
-				}
-
-				// Handle extension UI requests (select, confirm, input, etc.)
-				if (msg.type === "extension_ui_request") {
-					const active = getActiveChannel();
-					const adapter = active
-						? state.adapters.get(active.platform)
-						: undefined;
-					if (adapter) {
-						// Desktop footer/composer updates belong in the live reply, not separate chat messages.
-						if (!pendingCompletions[0]?.onEvent || !["setStatus", "setWidget", "setTitle"].includes(msg.method)) handleExtensionUiRequest(msg, adapter).catch((err) => {
-							logger.error(
-								"[gateway] Failed to handle extension UI request:",
-								err,
-							);
-							if (isDialogUiMethod(msg.method)) {
-								cancelUiRequest(msg.id);
-							}
-						});
-					} else if (isDialogUiMethod(msg.method)) {
-						logger.warn(
-							"[gateway] No adapter for extension UI request — cancelling so Pi cannot hang",
-						);
-						cancelUiRequest(msg.id);
-					}
-				}
-
-				// Stream text deltas to active completion
-				const completion = pendingCompletions[0];
-				const streamed = completion?.stream.consume(msg);
-				if (completion && streamed !== null && streamed !== undefined) {
-					completion.streamedText = streamed;
-					completion.onStream?.(streamed);
-				}
-
-				// Broadcast events
-				if (msg.type === "response") {
-					broadcastClients("response", msg);
-				} else {
-					broadcastClients("event", msg);
-				}
-			} catch {
-				logger.warn("[gateway] Failed to parse RPC line:", line.slice(0, 200));
-			}
-		}
+		for (const line of lines) handleRpcLine(line);
 	});
 
 	proc.stderr?.on("data", (data: Buffer) => {
@@ -601,27 +608,13 @@ function createRpcProcess(): any {
 
 	proc.on("exit", (code: number) => {
 		logger.info(`[gateway] pi process exited with code ${code}`);
+	});
+	// 'exit' can precede the last stdout data; 'close' means all stdio has drained.
+	proc.on("close", (code: number) => {
 		if (rpcProcess !== proc) return;
-		// Flush any remaining line in the buffer (could be a large agent_end)
-		if (lineBuffer.trim()) {
-			try {
-				const msg = JSON.parse(lineBuffer.trim());
-				if (msg.type === "agent_end") {
-					const text = agentEndText(msg, pendingCompletions[0]?.stream.text);
-					logger.info(
-						`[gateway] agent_end flushed from buffer on exit, text length: ${text.length}`,
-					);
-					const completion = pendingCompletions.shift();
-					if (completion) {
-						const error = agentEndError(msg);
-						if (error) completion.reject(new Error(error));
-						else completion.resolve(text);
-					}
-				}
-			} catch {
-				logger.debug("[gateway] Unparseable data in stdout buffer on exit");
-			}
-		}
+		// Use the same event handler for an unterminated last RPC line.
+		lineBuffer += stdoutDecoder.decode();
+		if (lineBuffer.trim()) handleRpcLine(lineBuffer.trim());
 		rejectPendingRpc(new Error(`pi process exited with code ${code}`));
 		// Clean up any pending interactive UI requests
 		cleanupPendingUiRequests();
@@ -723,8 +716,14 @@ async function sendPromptRpc(
 		const noticeMs = config.promptTimeoutMs ?? 300000;
 		if (noticeMs > 0 && onSlow) completion.timer = setInterval(() => completion.onSlow?.(Date.now() - startedAt), noticeMs);
 		pendingCompletions.push(completion);
-		sendRpc("prompt", { message }).then((response: any) => {
+		sendRpc("prompt", { message }).then(async (response: any) => {
 			if (!response.success) throw new Error(`Prompt rejected: ${JSON.stringify(response)}`);
+			// An input handler can consume a prompt without starting the agent or emitting agent_end.
+			if (!pendingCompletions.includes(completion) || completion.agentStarted) return;
+			const state = await sendRpc("get_state") as { success?: boolean; data?: { isStreaming?: boolean; isCompacting?: boolean } };
+			if (pendingCompletions[0] === completion && !completion.agentStarted && state.success && state.data?.isStreaming === false && state.data.isCompacting === false) {
+				settleRpcTurn({ messages: [] });
+			}
 		}).catch((error) => {
 			const index = pendingCompletions.indexOf(completion);
 			if (index < 0) return; // A terminal event already settled this turn.
@@ -779,6 +778,7 @@ const adapterCallbacks: AdapterCallbacks = {
 				message.channelId,
 				message.content,
 				message.userId,
+				typeof message.metadata?.replyToMessageId === "string" ? message.metadata.replyToMessageId : undefined,
 			)
 		) {
 			return;
@@ -819,13 +819,23 @@ const adapterCallbacks: AdapterCallbacks = {
 		if ((activeChatTurn || isAgentBusy()) && !privilegedRestart && !readOnlySession) {
 			const turn = activeChatTurn;
 			if (turn?.kind === "prompt" && !turn.stopping && ownsChatTurn(turn.message, message) && !sessionCmd.startsWith("/") && !sessionCmd.startsWith("Callback:")) {
+				let notice: string;
 				try {
-					if (isAgentBusy()) await sendSteerRpc(message.content);
-					else turn.queued.push(message.content);
-					await adapterForCommand?.sendMessage(message.channelId, "↪️ 已收到补充要求，本轮会按这个调整。");
+					if (isAgentBusy()) {
+						await sendSteerRpc(message.content);
+						notice = "↪️ 已收到补充要求，本轮会按这个调整。";
+					} else if (turn.phase === "preparing") {
+						turn.queued.push(message.content);
+						notice = "↪️ 已收到补充要求，本轮会按这个调整。";
+					} else {
+						turn.deferred.push(message);
+						notice = "↪️ 本轮模型已结束，补充已排队；回复发送完成后会启动下一轮。";
+					}
 				} catch (error) {
 					await adapterForCommand?.sendMessage(message.channelId, "❌ 补充要求未提交，请等当前任务结束后重试。");
+					return;
 				}
+				await adapterForCommand?.sendMessage(message.channelId, notice).catch((error) => logger.warn("[gateway] Follow-up accepted but acknowledgement delivery failed:", error));
 			} else await adapterForCommand?.sendMessage(message.channelId, "⏳ 当前任务还在执行，请结束后再操作。任务发起者可补充要求或使用 /stop。");
 			return;
 		}
@@ -834,6 +844,7 @@ const adapterCallbacks: AdapterCallbacks = {
 		const reservedTurn = activeChatTurn ? null : {
 			message, kind: isGatewayCommand ? "command" as const : "prompt" as const,
 			stopping: false, queued: [] as string[], reply: undefined as ChatReply | undefined,
+			phase: "preparing" as "preparing" | "running" | "delivering", deferred: [] as PlatformMessage[],
 		};
 		if (reservedTurn) activeChatTurn = reservedTurn;
 		try {
@@ -1363,16 +1374,19 @@ const adapterCallbacks: AdapterCallbacks = {
 				const guard = buildPolicyGuard(message.platform, message.userId);
 				const prompt = [message.content, ...turn.queued].join("\n\n");
 				turn.queued = [];
+				turn.phase = "running";
 				const text = await sendPromptRpc(`${guard}\n\n${prompt}`,
 					(text) => reply?.stream(text), undefined, (event) => {
 						if (event.type === "message_end" && event.message?.stopReason === "aborted") turn.stopping = true;
 						reply?.event(event);
 					});
+				turn.phase = "delivering";
 				await reply?.finish(text, turn.stopping ? "stopped" : "success");
 			} catch (error) {
+				turn.phase = "delivering";
 				logger.error("[gateway] Chat turn failed:", error);
 				const detail = error instanceof Error ? error.message : String(error);
-				try { await reply?.finish(detail, "error"); }
+				try { await reply?.finish(turn.stopping ? "" : detail, turn.stopping ? "stopped" : "error"); }
 				catch (deliveryError) { logger.error("[gateway] Failed to deliver turn error:", deliveryError); }
 			} finally {
 				cleanupPendingUiRequests();
@@ -1381,7 +1395,17 @@ const adapterCallbacks: AdapterCallbacks = {
 				setActiveChannel(null);
 			}
 		} finally {
-			if (reservedTurn && activeChatTurn === reservedTurn) activeChatTurn = null;
+			if (reservedTurn && activeChatTurn === reservedTurn) {
+				activeChatTurn = null;
+				if (reservedTurn.deferred.length) {
+					if (reservedTurn.stopping) {
+						await adapterForCommand?.sendMessage(message.channelId, "🛑 已取消排队的补充，未启动后续任务。");
+					} else {
+						const first = reservedTurn.deferred[0];
+						await adapterCallbacks.onMessage({ ...first, content: reservedTurn.deferred.map((item) => item.content).join("\n\n") });
+					}
+				}
+			}
 		}
 	},
 	onInteractiveResponse: (response: InteractiveResponse, fromUserId?: string) => {

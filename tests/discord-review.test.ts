@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { DiscordAdapter } from "../src/adapters/discord.js";
 import { discordRetryAfterMs, splitDiscordContent, truncateDiscordMarkdown } from "../src/adapters/discord-interactive.js";
-import { cancelUiRequest, handleExtensionUiRequest, parseInteractiveTextReply, resetInteractiveStateForTests, setActiveChannel, setFlushHandler, setStdinWriter } from "../src/interactive.js";
+import { cancelUiRequest, handleExtensionUiRequest, handleInteractiveResponse, parseInteractiveTextReply, pendingUiCount, resetInteractiveStateForTests, setActiveChannel, setFlushHandler, setStdinWriter, setStreamRedirectHandler, tryConsumeTextReply } from "../src/interactive.js";
 
 type Request = { endpoint: string; options: RequestInit; payload: any; file?: string };
 function fixture() {
@@ -177,4 +177,31 @@ assert.equal(discordRetryAfterMs(429, JSON.stringify({ retry_after: 31 })), 3105
 	assert.equal(id, "sent-2");
 	assert.equal(f.requests[1].payload.components[0].components[0].custom_id, "resume:0");
 }
+
+// Explicit replies answer their own permission question, even with another dialog open.
+{
+	const f = fixture(); resetInteractiveStateForTests();
+	const responses: any[] = []; let resumes = 0;
+	setActiveChannel({ platform: "discord", channelId: "c", userId: "owner" });
+	setStdinWriter((line) => responses.push(JSON.parse(line))); setStreamRedirectHandler(() => { resumes++; });
+	await handleExtensionUiRequest({ type: "extension_ui_request", id: "A", method: "select", title: "A?", options: ["Allow A", "No"] }, f.adapter);
+	await handleExtensionUiRequest({ type: "extension_ui_request", id: "B", method: "select", title: "B?", options: ["Allow B", "No"] }, f.adapter);
+	assert.equal(tryConsumeTextReply("discord", "c", "1", "owner", "sent-1"), true);
+	assert.equal(responses[0].id, "A"); assert.equal(responses[0].value, "Allow A");
+	assert.equal(pendingUiCount(), 1); assert.equal(resumes, 0);
+	assert.equal(tryConsumeTextReply("discord", "c", "1", "owner", "stale-dialog"), false);
+	assert.equal(handleInteractiveResponse({ requestId: "B", value: "0" }, "owner"), true);
+	assert.equal(resumes, 1); resetInteractiveStateForTests();
+}
+
+// Once the complete attachment has delivered, a failed placeholder edit must not resend it.
+{
+	const f = fixture(); const { ChatReply } = await import("../src/chat-reply.js");
+	const reply = new ChatReply(f.adapter, { platform: "discord", channelId: "c", userId: "owner", id: "m", content: "hi", timestamp: 1 });
+	await reply.start();
+	f.response((r) => r.options.method === "PATCH" ? new Response("denied", { status: 403 }) : new Response(JSON.stringify({ id: "attachment" })));
+	await reply.finish("long complete answer ".repeat(1000));
+	assert.equal(f.requests.filter((r) => r.file !== undefined).length, 1);
+}
+
 console.log("Discord Hermes review regressions passed");

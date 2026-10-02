@@ -4,6 +4,16 @@ import { AssistantStream, agentEndText, agentEndError } from "../src/agent-respo
 import { ownsChatTurn } from "../src/chat-turn.js";
 import type { PlatformAdapter, PlatformMessage } from "../src/adapters/base.js";
 
+{
+	const stream = new AssistantStream();
+	stream.consume({ type: "message_end", message: { role: "custom", display: true, content: "extension notice" } });
+	assert.equal(stream.consume({ type: "message_end", message: { role: "custom", display: false, content: "private context" } }), null);
+	const assistant = { role: "assistant", content: [{ type: "text", text: "answer" }] };
+	stream.consume({ type: "message_end", message: assistant });
+	assert.equal(stream.finalText({ messages: [assistant] }), "answer\n\nextension notice");
+	assert.equal(stream.finalText({ messages: [assistant, { role: "custom", display: true, content: "extension notice" }] }), "answer\n\nextension notice");
+}
+
 assert.match(agentEndText({ messages: [{ role: "assistant", content: "partial", stopReason: "length" }] }), /输出长度限制/);
 
 const message: PlatformMessage = { id: "input", platform: "discord", channelId: "channel", userId: "owner", content: "hello", timestamp: 1 };

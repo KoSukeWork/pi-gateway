@@ -184,7 +184,7 @@ export function cancelUiRequest(requestId: string, reason: "cancelled" | "expire
 			.catch(() => {});
 	}
 	sendUiResponse(requestId, { requestId, cancelled: true });
-	if (pending) streamRedirectHandler?.();
+	if (pending && !pendingUiRequests.size) streamRedirectHandler?.();
 }
 
 /**
@@ -318,10 +318,11 @@ export function parseInteractiveTextReply(
 function latestPendingForChannel(
 	platform: string,
 	channelId: string,
+	messageId?: string,
 ): PendingUiRequest | undefined {
 	let match: PendingUiRequest | undefined;
 	for (const pending of pendingUiRequests.values()) {
-		if (pending.platform === platform && pending.channelId === channelId) {
+		if (pending.platform === platform && pending.channelId === channelId && (!messageId || pending.messageId === messageId)) {
 			match = pending;
 		}
 	}
@@ -343,8 +344,9 @@ export function tryConsumeTextReply(
 	channelId: string,
 	content: string,
 	userId?: string,
+	replyToMessageId?: string,
 ): boolean {
-	const pending = latestPendingForChannel(platform, channelId);
+	const pending = latestPendingForChannel(platform, channelId, replyToMessageId);
 	if (!pending) return false;
 	if (pending.userId && userId && pending.userId !== userId) {
 		return false;
@@ -420,8 +422,8 @@ export function handleInteractiveResponse(
 		.catch(() => {});
 	sendUiResponse(response.requestId, response);
 
-	// Redirect subsequent streaming to a new message after select/confirm
-	streamRedirectHandler?.();
+	// Keep the reply waiting while another dialog is still open.
+	if (!pendingUiRequests.size) streamRedirectHandler?.();
 	return true;
 }
 

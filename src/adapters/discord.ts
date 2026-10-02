@@ -981,9 +981,12 @@ export class DiscordAdapter extends BaseAdapter {
     const key = `${channelId}:${messageId}`;
     const preview = options?.finalize === false;
     let chunks = preview ? [truncateDiscordContent(content)] : splitDiscordContent(content);
+    const totalChunks = chunks.length;
+    let attachmentDelivered = false;
     if (!preview && (chunks.length > DiscordAdapter.MAX_SPLIT_MESSAGES || chunks.some((chunk) => !chunk.trim()))) {
       try {
         await this.sendTextAttachment(channelId, content, "📄 完整回复见附件。");
+        attachmentDelivered = true;
         chunks = ["📄 回复较长，完整文本已发送为附件。"];
       } catch (error) {
         logger.warn("[Discord] Long response attachment unavailable; retaining complete text delivery:", error);
@@ -994,14 +997,27 @@ export class DiscordAdapter extends BaseAdapter {
       return;
     }
     if (preview && this.previews.get(key) === chunks[0]) return;
-    await this.requestDiscordWithRetry(
+    try {
+      await this.requestDiscordWithRetry(
       `/channels/${channelId}/messages/${messageId}`,
       {
         method: "PATCH",
         body: JSON.stringify({ content: chunks[0], ...(!preview && this.activeReplies.has(key) ? { components: [] } : {}), allowed_mentions: { parse: [], replied_user: false } }),
       },
       "edit message",
-    );
+      );
+    } catch (error) {
+      if (!attachmentDelivered) throw error;
+      // Final content has delivered; a stale placeholder is cleanup, not a failed delivery.
+      logger.warn("[Discord] Full attachment delivered but placeholder edit failed:", error);
+      this.activeReplies.delete(key);
+      this.previews.delete(key);
+      for (const id of [...(this.overflowMessages.get(key) ?? []), messageId]) {
+        await this.deleteMessage(channelId, id).catch((cleanupError) => logger.warn("[Discord] Could not remove the obsolete reply:", cleanupError));
+      }
+      this.overflowMessages.delete(key);
+      return { partial: false, deliveredChunks: totalChunks, totalChunks };
+    }
     if (preview) {
       this.previews.set(key, chunks[0]);
       if (this.previews.size > 256) this.previews.delete(this.previews.keys().next().value!);
