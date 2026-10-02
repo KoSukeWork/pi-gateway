@@ -38,6 +38,16 @@ function fakeAdapter() {
 	assert.ok(f.edits.at(-1)!.content.includes("x".repeat(500)));
 }
 
+// Permission context is fully delivered once, before the dialog is displayed.
+{
+	const f = fakeAdapter(); const reply = new ChatReply(f.adapter, message, 1);
+	await reply.start(); const context = "complete context ".repeat(250);
+	reply.stream(context);
+	await reply.waitForAnswer(); await reply.waitForAnswer();
+	assert.equal(f.sends.filter((text) => text.includes(context)).length, 1);
+	await reply.finish("answer");
+}
+
 // A blocked streaming PATCH must finish before the final edit. Later deltas are coalesced.
 {
 	const f = fakeAdapter();

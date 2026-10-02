@@ -156,7 +156,6 @@ import {
 	getActiveChannel,
 	setStreamRedirectHandler,
 	setFlushHandler,
-	flushHandler,
 	cleanupPendingUiRequests,
 	cancelUiRequest,
 	isDialogUiMethod,
@@ -558,9 +557,8 @@ function createRpcProcess(): any {
 						? state.adapters.get(active.platform)
 						: undefined;
 					if (adapter) {
-						if (isDialogUiMethod(msg.method)) flushHandler?.();
 						// Desktop footer/composer updates belong in the live reply, not separate chat messages.
-						if (!["setStatus", "setWidget", "setTitle", "set_editor_text"].includes(msg.method)) handleExtensionUiRequest(msg, adapter).catch((err) => {
+						if (!pendingCompletions[0]?.onEvent || !["setStatus", "setWidget", "setTitle"].includes(msg.method)) handleExtensionUiRequest(msg, adapter).catch((err) => {
 							logger.error(
 								"[gateway] Failed to handle extension UI request:",
 								err,
@@ -775,7 +773,7 @@ const adapterCallbacks: AdapterCallbacks = {
 
 		const sessionCmd = message.content.trim();
 		if (
-			!sessionCmd.startsWith("/") &&
+			!/^\/(help|stop|abort|new|detach|continue|resume|session|model|restart)(?:\s|$)/i.test(sessionCmd) &&
 			tryConsumeTextReply(
 				message.platform,
 				message.channelId,
@@ -1374,7 +1372,7 @@ const adapterCallbacks: AdapterCallbacks = {
 			} catch (error) {
 				logger.error("[gateway] Chat turn failed:", error);
 				const detail = error instanceof Error ? error.message : String(error);
-				try { await reply?.finish(detail.slice(0, 600), "error"); }
+				try { await reply?.finish(detail, "error"); }
 				catch (deliveryError) { logger.error("[gateway] Failed to deliver turn error:", deliveryError); }
 			} finally {
 				cleanupPendingUiRequests();

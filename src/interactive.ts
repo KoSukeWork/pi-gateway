@@ -32,13 +32,18 @@ export interface InteractiveUiRequest {
 		| "setWidget"
 		| "setTitle"
 		| "set_editor_text";
-	title: string;
+	title?: string;
 	message?: string;
 	options?: string[];
 	placeholder?: string;
 	prefill?: string;
 	notifyType?: "info" | "warning" | "error";
 	timeout?: number;
+	statusKey?: string;
+	statusText?: string;
+	widgetKey?: string;
+	widgetLines?: string[];
+	text?: string;
 }
 
 /** Platform-agnostic description of an interactive prompt. */
@@ -115,8 +120,8 @@ export function setStreamRedirectHandler(fn: (() => void) | null): void {
 /** Set by index.ts — called immediately when an extension_ui_request
  * arrives on stdout, to flush full accumulated text into the placeholder
  * before the user sees the interactive prompt. */
-export let flushHandler: (() => void) | null = null;
-export function setFlushHandler(fn: (() => void) | null): void {
+export let flushHandler: (() => void | Promise<void>) | null = null;
+export function setFlushHandler(fn: (() => void | Promise<void>) | null): void {
 	flushHandler = fn;
 }
 
@@ -202,14 +207,16 @@ export async function handleExtensionUiRequest(
 	const prompt: InteractivePrompt = {
 		requestId: msg.id,
 		method: msg.method,
-		title: msg.title,
-		message: msg.message,
+		title: msg.title ?? msg.statusKey ?? msg.widgetKey ?? "",
+		message: msg.method === "set_editor_text" ? msg.text : msg.method === "setStatus" ? msg.statusText : msg.method === "setWidget" ? msg.widgetLines?.join("\n") : msg.message,
 		options: msg.options,
 		placeholder: msg.placeholder,
 		prefill: msg.prefill,
 		notifyType: msg.notifyType,
 	};
 
+	// Clears are changes to transient UI, not new display content.
+	if ((msg.method === "setStatus" && !msg.statusText) || (msg.method === "setWidget" && !msg.widgetLines?.length) || (msg.method === "set_editor_text" && !msg.text)) return;
 	// Fire-and-forget methods — display but don't track for response
 	const fireAndForget = new Set([
 		"notify",
@@ -239,6 +246,9 @@ export async function handleExtensionUiRequest(
 	}, timeoutMs);
 	pendingUiRequests.set(msg.id, pending);
 	try {
+		await flushHandler?.();
+		if (pendingUiRequests.get(msg.id) !== pending) return;
+		if (activeChannel !== channel) { cancelUiRequest(msg.id); return; }
 		const result = await adapter.sendInteractive(channel.channelId, prompt);
 		if (!result?.messageId || result.messageId === "0") {
 			if (pendingUiRequests.get(msg.id) === pending) cancelUiRequest(msg.id);
@@ -299,7 +309,7 @@ export function parseInteractiveTextReply(
 	}
 
 	if (pending.method === "input" || pending.method === "editor") {
-		return { value: text };
+		return { value: content };
 	}
 
 	return null;
@@ -316,6 +326,12 @@ function latestPendingForChannel(
 		}
 	}
 	return match;
+}
+
+/** A dialog answer should not require another bot mention in its own channel. */
+export function hasPendingInteractiveForUser(platform: string, channelId: string, userId: string): boolean {
+	const pending = latestPendingForChannel(platform, channelId);
+	return !!pending && (!pending.userId || pending.userId === userId);
 }
 
 /**
@@ -335,8 +351,7 @@ export function tryConsumeTextReply(
 	}
 	const parsed = parseInteractiveTextReply(content, pending);
 	if (!parsed) return false;
-	handleInteractiveResponse({ requestId: pending.requestId, ...parsed });
-	return true;
+	return handleInteractiveResponse({ requestId: pending.requestId, ...parsed }, userId);
 }
 
 /**
@@ -378,9 +393,7 @@ export function handleInteractiveResponse(
 		return false;
 	}
 
-	logger.info(
-		`[interactive] Response for ${response.requestId.slice(0, 8)}…: ${response.value ?? (response.confirmed ? "confirmed" : "?")}${response.cancelled ? " (cancelled)" : ""}`,
-	);
+	logger.info(`[interactive] Response received for ${response.requestId.slice(0, 8)}…${response.cancelled ? " (cancelled)" : ""}`);
 
 	// Resolve index-based select responses back to option text
 	// (telegram/discord use indices in callback_data to stay under size limits)

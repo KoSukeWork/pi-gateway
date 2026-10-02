@@ -70,19 +70,30 @@ function safeSlice(text: string, end: number): string {
 	return text.slice(0, previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff ? end - 1 : end);
 }
 
-function openCodeFence(text: string, current: string | null = null): string | null {
-	for (const match of text.matchAll(/^ {0,3}(```|~~~)([^\n]*)$/gm)) {
-		if (!current) current = match[1] + match[2].trim().slice(0, 60);
-		else if (match[1] === current.slice(0, 3) && !match[2].trim()) current = null;
+interface CodeFence { marker: string; opener: string }
+function updateCodeFence(match: RegExpMatchArray, current: CodeFence | null): CodeFence | null {
+	if (!current) {
+		if (match[1][0] === "`" && match[2].includes("`")) return null;
+		return { marker: match[1], opener: match[0] };
 	}
+	return match[1][0] === current.marker[0] && match[1].length >= current.marker.length && !match[2].trim() ? null : current;
+}
+function fenceMatches(text: string): RegExpMatchArray[] {
+	return [...text.matchAll(/^ {0,3}(`{3,}|~{3,})([^\n]*)$/gm)];
+}
+function openCodeFence(text: string): CodeFence | null {
+	let current: CodeFence | null = null;
+	for (const match of fenceMatches(text)) current = updateCodeFence(match, current);
 	return current;
 }
 
 /** Keep live status text outside an unfinished code block. */
 export function truncateDiscordMarkdown(text: string, max = DISCORD_CONTENT_MAX): string {
-	const preview = truncateDiscordContent(text, Math.max(1, max - 4));
+	const reserve = Math.max(4, ...fenceMatches(text).map((match) => match[1].length + 1));
+	if (reserve >= max) return truncateDiscordContent(text, max);
+	const preview = truncateDiscordContent(text, max - reserve);
 	const fence = openCodeFence(preview);
-	return fence ? `${preview}\n${fence.slice(0, 3)}` : preview;
+	return fence ? `${preview}\n${fence.marker}` : preview;
 }
 
 /**
@@ -92,6 +103,7 @@ export function truncateDiscordMarkdown(text: string, max = DISCORD_CONTENT_MAX)
 function splitPlainContent(
 	text: string,
 	max = DISCORD_CONTENT_MAX,
+	protectedLines: Array<{ start: number; end: number }> = [],
 ): string[] {
 	if (max < 1) return text ? [text] : [];
 	const normalized = text.replace(/\r\n/g, "\n");
@@ -115,6 +127,9 @@ function splitPlainContent(
 		cut = safeSlice(rest, cut).length;
 		if (cut === 0) cut = Math.min(2, rest.length);
 		if (skipDelimiter) cut += 1;
+		const offset = normalized.length - rest.length;
+		const line = protectedLines.find((range) => range.start < offset + cut && range.end > offset + cut);
+		if (line) cut = line.start > offset ? line.start - offset : line.end - offset;
 		const chunk = rest.slice(0, cut);
 		if (chunk) chunks.push(chunk);
 		rest = rest.slice(cut);
@@ -126,12 +141,21 @@ function splitPlainContent(
 /** Close/reopen fenced code across final messages, preserving its language. */
 export function splitDiscordContent(text: string, max = DISCORD_CONTENT_MAX): string[] {
 	const normalized = text.replace(/\r\n/g, "\n");
-	if (max < 100 || !/^ {0,3}(```|~~~)/m.test(normalized) || normalized.length <= max) return splitPlainContent(normalized, max);
-	let fence: string | null = null;
-	return splitPlainContent(normalized, max - 70).map((chunk) => {
-		const prefix = fence ? `${fence}\n` : "";
-		fence = openCodeFence(chunk, fence);
-		return `${prefix}${chunk}${fence ? `\n${fence.slice(0, 3)}` : ""}`;
+	const matches = fenceMatches(normalized);
+	if (max < 100 || !matches.length || normalized.length <= max) return splitPlainContent(normalized, max);
+	const reserve = Math.max(...matches.map((match) => match[0].length + match[1].length + 2));
+	const budget = max - reserve;
+	const lines = matches.map((match) => ({ start: match.index!, end: match.index! + match[0].length + (normalized[match.index! + match[0].length] === "\n" ? 1 : 0) }));
+	if (budget < 2 || lines.some((line) => line.end - line.start > budget)) return splitPlainContent(normalized, max);
+	let fence: CodeFence | null = null;
+	let offset = 0;
+	return splitPlainContent(normalized, budget, lines).map((chunk) => {
+		const prefix = fence ? `${fence.opener}\n` : "";
+		for (const match of matches) {
+			if (match.index! >= offset && match.index! < offset + chunk.length) fence = updateCodeFence(match, fence);
+		}
+		offset += chunk.length;
+		return `${prefix}${chunk}${fence ? `\n${fence.marker}` : ""}`;
 	});
 }
 
@@ -141,10 +165,7 @@ export function discordRetryAfterMs(status: number, body: string): number | null
 	try {
 		const parsed = JSON.parse(body) as { retry_after?: unknown };
 		if (typeof parsed.retry_after === "number" && Number.isFinite(parsed.retry_after)) {
-			return Math.min(
-				Math.max(Math.ceil(parsed.retry_after * 1000) + 50, 50),
-				15_000,
-			);
+			return Math.min(Math.max(Math.ceil(parsed.retry_after * 1000) + 50, 50), 2_147_483_647);
 		}
 	} catch {
 		// use fallback
@@ -184,9 +205,11 @@ export function parseDiscordButtonCustomId(
 	const rawValue = parts.slice(3).join(":");
 	if (!requestId) return null;
 	if (kind === "c") {
+		if (rawValue !== "0" && rawValue !== "1") return null;
 		return { requestId, confirmed: rawValue === "1" };
 	}
 	if (kind === "s") {
+		if (!/^\d+$/.test(rawValue)) return null;
 		return { requestId, value: rawValue };
 	}
 	return null;
@@ -278,7 +301,7 @@ function selectButtons(
 			{
 				type: 2 as const,
 				style: buttonStyleForLabel(opt),
-				label: truncateDiscordLabel(opt),
+				label: truncateDiscordLabel(opt || "(empty option)"),
 				custom_id,
 			},
 		];
@@ -303,7 +326,7 @@ export function buildDiscordInteractiveMessage(
 			const noId = discordButtonCustomId("c", prompt.requestId, "0");
 			return {
 				content: truncateDiscordContent(confirmContent(prompt)),
-				components: [
+				components: yesId.length > DISCORD_CUSTOM_ID_MAX || noId.length > DISCORD_CUSTOM_ID_MAX ? [] : [
 					{
 						type: 1,
 						components: [
@@ -344,6 +367,7 @@ export function buildDiscordInteractiveMessage(
 }
 
 export function buildDiscordInputModal(prompt: InteractivePrompt): Record<string, unknown> {
+	if ((prompt.prefill?.length ?? 0) > 4000) throw new Error("Discord modal cannot preserve a prefill longer than 4000 characters");
 	return {
 		custom_id: `ui:input:${prompt.requestId}`,
 		title: truncateDiscordLabel(prompt.title || "填写回答", 45),
@@ -355,7 +379,7 @@ export function buildDiscordInputModal(prompt: InteractivePrompt): Record<string
 			required: false,
 			max_length: 4000,
 			...(prompt.placeholder ? { placeholder: truncateDiscordLabel(prompt.placeholder, 100) } : {}),
-			...(prompt.prefill ? { value: prompt.prefill.slice(0, 4000) } : {}),
+			...(prompt.prefill ? { value: prompt.prefill } : {}),
 		}] }],
 	};
 }

@@ -89,7 +89,8 @@ function fakeDiscord() {
 	const cleanup = requests.findLast((request) => request.method === "PATCH")!;
 	assert.match(cleanup.body.content, /回答已提交/);
 	assert.ok(!cleanup.body.content.includes("private answer"));
-	const modal = buildDiscordInputModal({ requestId: "q", method: "editor", title: "t".repeat(70), prefill: "x".repeat(5000) }) as any;
+	assert.throws(() => buildDiscordInputModal({ requestId: "q", method: "editor", title: "t", prefill: "x".repeat(5000) }), /cannot preserve/);
+	const modal = buildDiscordInputModal({ requestId: "q", method: "editor", title: "t".repeat(70), prefill: "x".repeat(4000) }) as any;
 	assert.equal(modal.title.length, 45);
 	assert.equal(modal.components[0].components[0].value.length, 4000);
 	resetInteractiveStateForTests();
@@ -120,6 +121,7 @@ function fakeDiscord() {
 	setStdinWriter((line) => lines.push(line));
 	setActiveChannel({ platform: "discord", channelId: "c", userId: "owner" });
 	const sending = handleExtensionUiRequest({ type: "extension_ui_request", id: "inflight", method: "confirm", title: "Allow?" }, adapter);
+	await new Promise((resolve) => setTimeout(resolve, 0));
 	assert.equal(pendingUiCount(), 1);
 	cancelUiRequest("inflight");
 	assert.equal(JSON.parse(lines[0]).cancelled, true);

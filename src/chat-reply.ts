@@ -20,8 +20,10 @@ export class ChatReply {
 	private lastBody = "";
 	private startedAt = Date.now();
 	private extensionStatuses = new Map<string, string>();
+	private extensionDisplayHistory = new Map<string, string>();
 	private starting: Promise<void> | null = null;
 	private finishing: Promise<void> | null = null;
+	private lastFlushedText = "";
 
 	constructor(
 		private adapter: PlatformAdapter,
@@ -59,11 +61,17 @@ export class ChatReply {
 		this.schedule();
 	}
 
-	waitForAnswer(): void {
+	async waitForAnswer(): Promise<void> {
 		if (this.closed) return;
 		this.waiting = true;
 		this.phase = "🙋 等待你的回答";
 		this.schedule(true);
+		// A permission question must not hide the explanation behind a clipped preview.
+		const text = this.text;
+		if (this.adapter.platform === "discord" && text.length > 1300 && text !== this.lastFlushedText) {
+			await this.adapter.sendMessage(this.message.channelId, `📄 提问前的完整回复：\n\n${text}`);
+			this.lastFlushedText = text;
+		}
 	}
 
 	resume(): void {
@@ -97,14 +105,18 @@ export class ChatReply {
 		} else if (event.type === "auto_compaction_end" || event.type === "auto_retry_end") {
 			this.phase = "⏳ 正在思考…";
 		} else if (event.type === "extension_ui_request" && event.method === "setStatus") {
-			const key = String(event.statusKey ?? "status");
+			const key = `status:${String(event.statusKey ?? "status")}`;
 			if (event.statusText) this.extensionStatuses.set(key, String(event.statusText));
 			else this.extensionStatuses.delete(key);
 		} else if (event.type === "extension_ui_request" && event.method === "setWidget") {
-			const key = String(event.widgetKey ?? "widget");
+			const key = `widget:${String(event.widgetKey ?? "widget")}`;
 			if (event.widgetLines?.length) this.extensionStatuses.set(key, event.widgetLines.join("\n"));
 			else this.extensionStatuses.delete(key);
+		} else if (event.type === "extension_ui_request" && event.method === "setTitle") {
+			if (event.title) this.extensionStatuses.set("title", String(event.title));
+			else this.extensionStatuses.delete("title");
 		} else return;
+		for (const [key, value] of this.extensionStatuses) this.extensionDisplayHistory.set(key, value);
 		this.schedule();
 	}
 
@@ -177,7 +189,7 @@ export class ChatReply {
 			: outcome === "error"
 				? `${this.text}${this.text ? "\n\n" : ""}❌ ${text}`
 				: text || this.text || "✅ 本轮已完成，没有文本回复。";
-		if (this.extensionStatuses.size) body += "\n\n扩展显示信息：\n" + [...this.extensionStatuses.entries()].map(([key, value]) => `${key}: ${value}`).join("\n\n");
+		if (this.extensionDisplayHistory.size) body += "\n\n扩展显示信息：\n" + [...this.extensionDisplayHistory.entries()].map(([key, value]) => `${key}: ${value}`).join("\n\n");
 		try {
 			const delivery = this.messageId
 				? await this.deliverFinal(body)

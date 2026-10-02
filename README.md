@@ -307,7 +307,7 @@ On Discord these are also registered as **slash commands** (`/help`, `/stop`, `/
 
 The default conversation uses a persistent Pi session file for each channel. `/new` creates a new isolated history; `/detach` returns to that channel's isolated history. Explicit `/continue` and `/resume` bindings take precedence. The gateway currently runs one shared RPC worker, so a task in another channel receives a busy response while it is occupied.
 
-See [Discord interaction behavior and verification](docs/discord-experience.md). Set `platforms.discord.reactions` to `false` to disable reaction feedback; missing reaction permission does not prevent replies. `allowedChannels` limits guild text ingress and `requireMention` accepts a direct mention or a reply to the bot.
+See [Discord interaction behavior and verification](docs/discord-experience.md). Set `platforms.discord.reactions` to `false` to disable reaction feedback; missing reaction permission does not prevent replies. `allowedChannels` and optional `allowedRoles` restrict guild text, slash commands, and components. `requireMention` accepts a direct mention, a reply to the bot, or an answer from the owner of a pending dialog. Replies over eight chunks use a complete UTF-8 attachment; if file upload is unavailable, complete text delivery remains available.
 
 ## Commands
 

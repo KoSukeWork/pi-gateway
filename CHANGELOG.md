@@ -13,6 +13,10 @@ All notable changes to this project will be documented in this file.
 - Back default channel conversations with distinct persistent Pi session files, restore their history when switching channels, and give `/new` a fresh history.
 
 ### Fixed
+- Preserve full streamed text on empty/suffix-only terminal events, display model output-limit warnings, and retain complete extension display content even when widgets are cleared. Route editor-text events instead of dropping them.
+- Complete attachment fallbacks through the deferred Discord original response. Prefer full text attachments above eight chunks; fall back to complete text when attachment permission is unavailable, and retry explicitly rejected reply references without their anchor.
+- Preserve input whitespace and long permission context, accept pending answers without another mention, prevent prompts after cancellation during context delivery, and enforce channel/role restrictions for slash and component entry points.
+- Preserve extended code fences and complete language strings, respect Discord's retry-after duration, and avoid resending a successful reply when obsolete-continuation cleanup fails. Free-text dialog answers are no longer written to logs.
 - Register prompt completions before sending RPC commands, so an ACK and terminal event in one stdout chunk cannot strand a thinking message. Propagate model errors and process exits, clear request timers, and settle active replies during shutdown.
 - Keep old RPC process exits from clearing a replacement worker's state. Close inline gateway resources when the host session shuts down.
 - Scope Discord resume choices to each displayed message instead of interpreting old indices against a newer list. Enforce picker ownership and expiry.

@@ -62,6 +62,10 @@ mock.method(DiscordAdapter.prototype, "setMessageReaction", async () => {});
 mock.method(DiscordAdapter.prototype, "sendMessage", async (channel: string, content: string) => { sends.push({ channel, content }); return `m-${sends.length}`; });
 mock.method(DiscordAdapter.prototype, "sendReply", async (message: PlatformMessage, content: string) => { sends.push({ channel: message.channelId, content }); await blockReply; return `m-${sends.length}`; });
 mock.method(DiscordAdapter.prototype, "editMessage", async (_channel: string, _id: string, content: string) => { edits.push(content); });
+mock.method(DiscordAdapter.prototype, "sendInteractive", async (_channel: string, prompt: any) => {
+	if (prompt.message) sends.push({ channel: _channel, content: prompt.message });
+	return { messageId: "dialog" };
+});
 
 const { default: gateway } = await import("../src/index.js");
 const auth = await import("../src/security/auth.js");
@@ -94,6 +98,13 @@ try {
 	mode = "held";
 	const running = callbacks.onMessage(message("long task"));
 	await pause();
+	emit({ type: "extension_ui_request", id: "editor-hint", method: "set_editor_text", text: "suggested editor text" });
+	await pause();
+	assert.equal(sends.at(-1)!.content, "suggested editor text");
+	emit({ type: "extension_ui_request", id: "editor", method: "editor", title: "Enter path" });
+	await pause();
+	await callbacks.onMessage(message("/tmp/file\n  keep  \n"));
+	assert.deepEqual(commands.at(-1), { type: "extension_ui_response", id: "editor", value: "/tmp/file\n  keep  \n" });
 	await callbacks.onMessage(message("adjust requirements"));
 	assert.equal(commands.at(-1)?.type, "steer");
 	const count = commands.length;
