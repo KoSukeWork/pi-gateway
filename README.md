@@ -7,16 +7,18 @@ Multi-platform chat bridge for pi — connect your AI agent to Telegram, Discord
 ## Features
 
 - **Multi-platform adapters** — Discord, Telegram, Slack, Twitch, WhatsApp, WebSocket
-- **Real-time streaming** — responses appear token-by-token via live message editing
+- **Live replies** — one reply shows thinking, tool activity, waiting for an answer, and elapsed time; serialized updates cannot overwrite the final answer
 - **Per-chat sessions** — isolated conversations with configurable reset policies (daily / idle)
 - **Background tasks** — spawn async work from chats, results delivered when ready
 - **Allowlist security** — DB-based and config-file pre-approved UIDs, admin roles, tool access policies
 - **Detached daemon mode** — `/gateway start -d` or `pi-gateway start` keeps the gateway alive after pi closes, in `~/pi-gateway-workspace`. Inline `/gateway start` keeps the current TUI working directory.
 - **HTTP + WebSocket API** — connect external clients, send prompts, receive streaming responses
 - **pi-native** — runs as a pi extension with `/gateway` slash commands and registered tools
-- **Interactive prompts** — `ctx.ui.select()` / `confirm()` / `input()` (including permission-plugin asks) are forwarded to chat. Telegram and Discord use buttons; you can also reply with the number. Unanswered dialogs cancel after 2 minutes so the RPC agent cannot hang.
-- **Mid-run steer** — if you send another chat message while the agent is busy (including waiting on a permission button), it is queued as Pi `steer` instead of being rejected.
-- **Long runs** — a turn that takes more than 5 minutes no longer fails the Discord waiter. You get a still-working notice; the real `agent_end` still replaces that message.
+- **Discord task controls** — replies to your message, adds 👀 while processing, replaces it with ✅/❌/🛑 on completion, and offers a Stop button plus `/stop`; `/help` lists chat commands
+- **Interactive prompts** — `ctx.ui.select()` / `confirm()` / `input()` (including permission-plugin asks) are forwarded to chat. Discord offers buttons and input modals; answers/expiry update the original prompt. Only its owner can answer. Text replies also work; unanswered dialogs cancel after 2 minutes.
+- **Mid-run steer** — the initiating user can add instructions in the original channel while a task runs. Other users/channels receive a busy notice; their messages cannot steer or switch that worker's session.
+- **Long runs** — replies keep showing elapsed time and current activity until the real terminal event. Long streaming previews stay within one message; complete replies are split once, with fenced code preserved.
+- **Discord command completion** — slash commands resolve their deferred original response; model/resume selections replace the selected picker with their result
 - **Session identity cards** — `/continue` and `/session` show project, model, and last messages instead of only a jsonl path
 - **New conversation in a folder** — `/new <path>` (admin) starts a fresh session whose bash/read/edit cwd is that directory
 - **Resume picker** — `/resume` lists recent sessions with project and last user text; Discord/Telegram buttons pick one
@@ -301,7 +303,11 @@ Then talk normally. That chat is bound to the desktop session file via RPC `swit
 
 If the session file was written in the last 15 seconds, `/continue` warns that the desktop Pi may still be live.
 
-On Discord these are also registered as **slash commands** (`/continue`, `/resume`, `/session`, `/detach`, `/new`, `/model`, `/restart`). Global commands can take a few minutes to appear; DMs work after the bot shares a server with you. Re-invite the bot with the `applications.commands` scope if `/` shows nothing.
+On Discord these are also registered as **slash commands** (`/help`, `/stop`, `/continue`, `/resume`, `/session`, `/detach`, `/new`, `/model`, `/restart`). Global commands can take a few minutes to appear; DMs work after the bot shares a server with you. Re-invite the bot with the `applications.commands` scope if `/` shows nothing.
+
+The default conversation uses a persistent Pi session file for each channel. `/new` creates a new isolated history; `/detach` returns to that channel's isolated history. Explicit `/continue` and `/resume` bindings take precedence. The gateway currently runs one shared RPC worker, so a task in another channel receives a busy response while it is occupied.
+
+See [Discord interaction behavior and verification](docs/discord-experience.md). Set `platforms.discord.reactions` to `false` to disable reaction feedback; missing reaction permission does not prevent replies. `allowedChannels` limits guild text ingress and `requireMention` accepts a direct mention or a reply to the bot.
 
 ## Commands
 

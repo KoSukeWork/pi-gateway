@@ -93,11 +93,14 @@ export function rememberResumeList(
 	channelId: string,
 	files: string[],
 	now = Date.now(),
+	messageId?: string,
 ): void {
-	pendingPicks.set(channelKey(platform, channelId), {
+	for (const [key, entry] of pendingPicks) if (entry.expiresAt < now) pendingPicks.delete(key);
+	pendingPicks.set(channelKey(platform, channelId, messageId), {
 		files: [...files],
 		expiresAt: now + RESUME_PICK_TTL_MS,
 	});
+	while (pendingPicks.size > 256) pendingPicks.delete(pendingPicks.keys().next().value!);
 }
 
 export function takeResumeChoice(
@@ -105,8 +108,9 @@ export function takeResumeChoice(
 	channelId: string,
 	index0: number,
 	now = Date.now(),
+	messageId?: string,
 ): { ok: true; sessionFile: string } | { ok: false; error: string } {
-	const key = channelKey(platform, channelId);
+	const key = channelKey(platform, channelId, messageId);
 	const entry = pendingPicks.get(key);
 	if (!entry || entry.expiresAt < now) {
 		pendingPicks.delete(key);
@@ -213,6 +217,6 @@ function sameFile(a: string, b: string): boolean {
 	return a.replace(/\\/g, "/").toLowerCase() === b.replace(/\\/g, "/").toLowerCase();
 }
 
-function channelKey(platform: string, channelId: string): string {
-	return `${platform}:${channelId}`;
+function channelKey(platform: string, channelId: string, messageId?: string): string {
+	return `${platform}:${channelId}${messageId ? `:${messageId}` : ""}`;
 }

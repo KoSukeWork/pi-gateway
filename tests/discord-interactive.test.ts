@@ -20,6 +20,10 @@ assert.deepEqual(splitDiscordContent(""), []);
 assert.deepEqual(splitDiscordContent("   "), []);
 assert.deepEqual(splitDiscordContent("short"), ["short"]);
 {
+	const text = "abc  \n\n    xyz \t".repeat(400);
+	assert.equal(splitDiscordContent(text).join(""), text);
+}
+{
 const parts = splitDiscordContent(`${"a".repeat(1500)}\n${"b".repeat(1500)}`);
 assert.equal(parts.length, 2);
 assert.ok(parts.every((part) => part.length <= DISCORD_CONTENT_MAX));
@@ -28,7 +32,7 @@ const indented = splitDiscordContent(
 	`${"a".repeat(1500)}\n    indented line ${"b".repeat(1000)}`,
 );
 assert.match(indented[1], /^    indented line/);
-	assert.equal(parts[0], "a".repeat(1500));
+	assert.equal(parts[0], "a".repeat(1500) + "\n");
 	assert.equal(parts[1], "b".repeat(1500));
 }
 {
@@ -107,7 +111,8 @@ const input = buildDiscordInteractiveMessage({
 	title: "Share why",
 	placeholder: "Reason shown back to the agent",
 });
-assert.equal(input.components.length, 0);
+assert.equal(input.components.length, 1);
+assert.equal(input.components[0].components[0].custom_id, `ui:i:${requestId}`);
 assert.ok(input.content.includes("Reply with your input"));
 
 assert.equal(

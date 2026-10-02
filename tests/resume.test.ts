@@ -92,3 +92,12 @@ try {
 } finally {
 	await rm(root, { recursive: true, force: true });
 }
+
+// Each Discord picker retains the files it displayed, even after a newer list opens.
+{
+	rememberResumeList("discord", "scoped", ["first.jsonl"], 1000, "picker-first");
+	rememberResumeList("discord", "scoped", ["second.jsonl"], 1000, "picker-second");
+	assert.deepEqual(takeResumeChoice("discord", "scoped", 0, 1000, "picker-first"), { ok: true, sessionFile: "first.jsonl" });
+	assert.deepEqual(takeResumeChoice("discord", "scoped", 0, 1000, "picker-second"), { ok: true, sessionFile: "second.jsonl" });
+	assert.equal(takeResumeChoice("discord", "scoped", 0, 1000, "unknown-picker").ok, false);
+}

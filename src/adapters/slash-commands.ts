@@ -1,4 +1,6 @@
 export const DISCORD_SLASH_COMMANDS = [
+	{ name: "stop", description: "Stop the current task and keep the conversation" },
+	{ name: "help", description: "Show chat commands and how to use this agent" },
 	{
 		name: "continue",
 		description: "Attach this chat to the last desktop Pi session",
@@ -75,7 +77,7 @@ export function slashInteractionToContent(data: {
 		if (typeof n === "string" && /^\d+$/.test(n.trim())) return `/resume ${n.trim()}`;
 		return "/resume";
 	}
-	if (["continue", "session", "detach", "restart"].includes(name)) {
+	if (["continue", "session", "detach", "restart", "stop", "help"].includes(name)) {
 		return `/${name}`;
 	}
 	return null;

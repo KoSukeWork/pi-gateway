@@ -34,11 +34,9 @@ import { randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
 import { isLoopbackHost, resolveDaemonInvocation, resolveRpcExtensionPath } from "./runtime-entry.js";
 import { buildRpcPiArgs, resolvePiInvocation } from "./resolve-pi.js";
-import {
-	isAgentAlreadyProcessingError,
-	routeChatMessage,
-	stillWorkingNotice,
-} from "./prompt-routing.js";
+import { ChatReply } from "./chat-reply.js";
+import { agentEndError, agentEndText, AssistantStream } from "./agent-response.js";
+import { ownsChatTurn, CHAT_HELP } from "./chat-turn.js";
 import {
 	formatModelListText,
 	modelListUsesInlineButtons,
@@ -58,8 +56,10 @@ import {
 	getOrCreateSession,
 	listSessions,
 	touchSession,
+	deleteSession,
 	type SessionConfig,
 } from "./sessions/store.js";
+import { ensureGatewaySessionFile, gatewaySessionFile } from "./sessions/gateway-session.js";
 import {
 	clearChannelBinding,
 	getChannelBinding,
@@ -193,6 +193,9 @@ interface GatewayConfig {
 			enabled: boolean;
 			botToken: string;
 			guildId?: string;
+			allowedChannels?: string[];
+			requireMention?: boolean;
+			reactions?: boolean;
 		};
 		twitch?: {
 			enabled: boolean;
@@ -298,6 +301,7 @@ interface PendingRequest {
 	id: string;
 	resolve: (msg: unknown) => void;
 	reject: (err: Error) => void;
+	timer: ReturnType<typeof setTimeout>;
 }
 const pendingRequests: PendingRequest[] = [];
 
@@ -311,13 +315,32 @@ interface PendingCompletion {
 	onSlow?: (elapsedMs: number) => void;
 	/** Accumulated streamed text from text_delta events */
 	streamedText: string;
+	stream: AssistantStream;
+	onEvent?: (event: Record<string, any>) => void;
 }
 const pendingCompletions: PendingCompletion[] = [];
 let rpcTurnActive = false;
+let activeChatTurn: {
+	message: PlatformMessage;
+	kind: "prompt" | "command";
+	reply?: ChatReply;
+	stopping: boolean;
+	queued: string[];
+} | null = null;
 
 function clearCompletionTimer(completion: PendingCompletion): void {
 	if (completion.timer) clearInterval(completion.timer);
 	completion.timer = null;
+}
+
+function rejectPendingRpc(error: Error): void {
+	rpcTurnActive = false;
+	while (pendingCompletions.length) pendingCompletions.shift()!.reject(error);
+	while (pendingRequests.length) {
+		const request = pendingRequests.shift()!;
+		clearTimeout(request.timer);
+		request.reject(error);
+	}
 }
 
 // Load/save config
@@ -447,6 +470,7 @@ function broadcastClients(event: string, data: unknown): void {
 
 // RPC to pi agent
 function createRpcProcess(): any {
+	rpcBoundSessionFile = null;
 	const extensionPath = resolveRpcExtensionPath(import.meta.url);
 	const invocation = resolvePiInvocation(buildRpcPiArgs(extensionPath));
 	logger.info(
@@ -462,6 +486,10 @@ function createRpcProcess(): any {
 	});
 	proc.on("error", (error) => {
 		logger.error("[gateway] Failed to start pi RPC process:", error);
+		if (rpcProcess === proc) {
+			rejectPendingRpc(error);
+			rpcProcess = null;
+		}
 	});
 
 	// Give the interactive bridge a way to write to pi's stdin
@@ -474,6 +502,7 @@ function createRpcProcess(): any {
 	const stdoutDecoder = new TextDecoder();
 	let lineBuffer = "";
 	proc.stdout?.on("data", (data: Buffer) => {
+		if (rpcProcess !== proc) return;
 		lineBuffer += stdoutDecoder.decode(data, { stream: true });
 		const lines = lineBuffer.split("\n");
 		// Keep the last (possibly incomplete) chunk in the buffer
@@ -483,18 +512,21 @@ function createRpcProcess(): any {
 			if (!line) continue;
 			try {
 				const msg = JSON.parse(line);
+				pendingCompletions[0]?.onEvent?.(msg);
+				if (msg.type === "agent_start") rpcTurnActive = true;
 
 				if (msg.id) {
 					const idx = pendingRequests.findIndex((r) => r.id === msg.id);
 					if (idx !== -1) {
 						const req = pendingRequests.splice(idx, 1)[0];
+						clearTimeout(req.timer);
 						req.resolve(msg);
 					}
 				}
 
 				// agent_end carries the full response — resolve pending completions
 				if (msg.type === "agent_end") {
-					const text = extractAgentEndText(msg);
+					const text = agentEndText(msg, pendingCompletions[0]?.stream.text);
 					logger.info(
 						`[gateway] agent_end received, text length: ${text.length}`,
 					);
@@ -502,7 +534,9 @@ function createRpcProcess(): any {
 					const active = getActiveChannel();
 					const completion = pendingCompletions.shift();
 					if (completion) {
-						completion.resolve(text);
+						const error = agentEndError(msg);
+						if (error) completion.reject(new Error(error));
+						else completion.resolve(text);
 					} else if (text.trim() && active) {
 						const lateAdapter = state.adapters.get(active.platform);
 						logger.warn(
@@ -524,9 +558,9 @@ function createRpcProcess(): any {
 						? state.adapters.get(active.platform)
 						: undefined;
 					if (adapter) {
-						// Flush full accumulated text into the placeholder NOW
-						flushHandler?.();
-						handleExtensionUiRequest(msg, adapter).catch((err) => {
+						if (isDialogUiMethod(msg.method)) flushHandler?.();
+						// Desktop footer/composer updates belong in the live reply, not separate chat messages.
+						if (!["setStatus", "setWidget", "setTitle", "set_editor_text"].includes(msg.method)) handleExtensionUiRequest(msg, adapter).catch((err) => {
 							logger.error(
 								"[gateway] Failed to handle extension UI request:",
 								err,
@@ -544,16 +578,11 @@ function createRpcProcess(): any {
 				}
 
 				// Stream text deltas to active completion
-				if (
-					msg.type === "message_update" &&
-					msg.assistantMessageEvent?.type === "text_delta" &&
-					typeof msg.assistantMessageEvent.delta === "string"
-				) {
-					const completion = pendingCompletions[0];
-					if (completion?.onStream) {
-						completion.streamedText += msg.assistantMessageEvent.delta;
-						completion.onStream(completion.streamedText);
-					}
+				const completion = pendingCompletions[0];
+				const streamed = completion?.stream.consume(msg);
+				if (completion && streamed !== null && streamed !== undefined) {
+					completion.streamedText = streamed;
+					completion.onStream?.(streamed);
 				}
 
 				// Broadcast events
@@ -574,30 +603,28 @@ function createRpcProcess(): any {
 
 	proc.on("exit", (code: number) => {
 		logger.info(`[gateway] pi process exited with code ${code}`);
+		if (rpcProcess !== proc) return;
 		// Flush any remaining line in the buffer (could be a large agent_end)
 		if (lineBuffer.trim()) {
 			try {
 				const msg = JSON.parse(lineBuffer.trim());
 				if (msg.type === "agent_end") {
-					const text = extractAgentEndText(msg);
+					const text = agentEndText(msg, pendingCompletions[0]?.stream.text);
 					logger.info(
 						`[gateway] agent_end flushed from buffer on exit, text length: ${text.length}`,
 					);
 					const completion = pendingCompletions.shift();
 					if (completion) {
-						completion.resolve(text);
+						const error = agentEndError(msg);
+						if (error) completion.reject(new Error(error));
+						else completion.resolve(text);
 					}
 				}
 			} catch {
 				logger.debug("[gateway] Unparseable data in stdout buffer on exit");
 			}
 		}
-		// Reject any remaining pending completions so they don't hang forever
-		rpcTurnActive = false;
-		while (pendingCompletions.length > 0) {
-			const completion = pendingCompletions.shift()!;
-			completion.reject(new Error(`pi process exited with code ${code}`));
-		}
+		rejectPendingRpc(new Error(`pi process exited with code ${code}`));
 		// Clean up any pending interactive UI requests
 		cleanupPendingUiRequests();
 		setActiveChannel(null);
@@ -628,11 +655,6 @@ async function switchRpcSession(sessionFile: string): Promise<void> {
 	rpcBoundSessionFile = sessionFile;
 }
 
-async function resetRpcSession(): Promise<void> {
-	await sendRpc("new_session");
-	rpcBoundSessionFile = null;
-}
-
 async function sendRpc(
 	command: string,
 	data: Record<string, unknown> = {},
@@ -643,47 +665,25 @@ async function sendRpc(
 	const payload = { id, type: command, ...data };
 
 	return new Promise((resolve, reject) => {
-		pendingRequests.push({ id, resolve, reject });
-
-		try {
-			rpcProcess.stdin.write(JSON.stringify(payload) + "\n");
-		} catch (err) {
-			const idx = pendingRequests.findIndex((r) => r.id === id);
-			if (idx !== -1) pendingRequests.splice(idx, 1);
-			reject(err);
-		}
-
-		setTimeout(() => {
+		const timer = setTimeout(() => {
 			const idx = pendingRequests.findIndex((r) => r.id === id);
 			if (idx !== -1) {
 				pendingRequests.splice(idx, 1);
 				reject(new Error("Request timeout"));
 			}
 		}, 30000);
-	});
-}
+		pendingRequests.push({ id, resolve, reject, timer });
 
-// Extract assistant response text from agent_end.messages
-function extractAgentEndText(agentEndMsg: Record<string, unknown>): string {
-	const messages = agentEndMsg.messages as
-		| Array<Record<string, unknown>>
-		| undefined;
-	if (!messages) return "";
-
-	const parts: string[] = [];
-	for (const msg of messages) {
-		if (msg.role === "assistant") {
-			const content = msg.content;
-			if (Array.isArray(content)) {
-				for (const block of content as Array<Record<string, unknown>>) {
-					if (block.type === "text" && typeof block.text === "string") {
-						parts.push(block.text as string);
-					}
-				}
-			}
+		try {
+			rpcProcess.stdin.write(JSON.stringify(payload) + "\n");
+		} catch (err) {
+			clearTimeout(timer);
+			const idx = pendingRequests.findIndex((r) => r.id === id);
+			if (idx !== -1) pendingRequests.splice(idx, 1);
+			reject(err);
 		}
-	}
-	return parts.join("\n");
+
+	});
 }
 
 // Send a prompt to pi and wait for agent_end to get the full response text.
@@ -707,62 +707,38 @@ async function sendPromptRpc(
 	message: string,
 	onStream?: (text: string) => void,
 	onSlow?: (elapsedMs: number) => void,
+	onEvent?: (event: Record<string, any>) => void,
 ): Promise<string> {
 	if (!rpcProcess) throw new Error("pi agent not running");
-
-	// Send the prompt and wait for the ACK (so we know the prompt was accepted)
-	const ackResponse = await sendRpc("prompt", { message });
-	const ack = ackResponse as Record<string, unknown>;
-	if (!ack.success) {
-		throw new Error(`Prompt rejected: ${JSON.stringify(ackResponse)}`);
-	}
-
+	// Register before writing: ACK, text, and agent_end can share one stdout chunk.
 	rpcTurnActive = true;
-	logger.info("[gateway] Prompt ACK received, waiting for agent_end...");
-
-	const noticeMs = config.promptTimeoutMs ?? 300000;
 	const startedAt = Date.now();
 	return new Promise((resolve, reject) => {
 		const completion: PendingCompletion = {
-			resolve: (text) => {
-				clearCompletionTimer(completion);
-				resolve(text);
-			},
-			reject: (err) => {
-				clearCompletionTimer(completion);
-				reject(err);
-			},
+			resolve: (text) => { clearCompletionTimer(completion); resolve(text); },
+			reject: (error) => { clearCompletionTimer(completion); reject(error); },
 			timer: null,
-			onStream,
-			onSlow,
+			onStream, onSlow, onEvent,
 			streamedText: "",
+			stream: new AssistantStream(),
 		};
-		if (noticeMs > 0) {
-			completion.timer = setInterval(() => {
-				const elapsed = Date.now() - startedAt;
-				logger.warn(
-					`[gateway] Prompt still running after ${Math.round(elapsed / 60000)} min; waiting for agent_end`,
-				);
-				completion.onSlow?.(elapsed);
-			}, noticeMs);
-		}
+		const noticeMs = config.promptTimeoutMs ?? 300000;
+		if (noticeMs > 0 && onSlow) completion.timer = setInterval(() => completion.onSlow?.(Date.now() - startedAt), noticeMs);
 		pendingCompletions.push(completion);
+		sendRpc("prompt", { message }).then((response: any) => {
+			if (!response.success) throw new Error(`Prompt rejected: ${JSON.stringify(response)}`);
+		}).catch((error) => {
+			const index = pendingCompletions.indexOf(completion);
+			if (index < 0) return; // A terminal event already settled this turn.
+			pendingCompletions.splice(index, 1);
+			rpcTurnActive = false;
+			completion.reject(error);
+		});
 	});
 }
 
 const adapterCallbacks: AdapterCallbacks = {
 	onMessage: async (message: PlatformMessage) => {
-		// Get or create session for this chat
-		const session = getOrCreateSession(
-			message.platform,
-			message.channelId,
-			message.userId,
-			{
-				resetPolicy: config.sessions.resetPolicy,
-				dailyHour: config.sessions.dailyHour,
-				idleMinutes: config.sessions.idleMinutes,
-			},
-		);
 
 		// Check allowlist
 		if (!isUserAllowed(message.platform as Platform, message.userId)) {
@@ -781,6 +757,19 @@ const adapterCallbacks: AdapterCallbacks = {
 			return;
 		}
 
+		// Get or create session for this chat
+		const session = getOrCreateSession(
+			message.platform,
+			message.channelId,
+			message.userId,
+			{
+				resetPolicy: config.sessions.resetPolicy,
+				dailyHour: config.sessions.dailyHour,
+				idleMinutes: config.sessions.idleMinutes,
+			},
+		);
+
+
 		// Store session reference
 		state.sessions.set(`${message.platform}:${message.channelId}`, session);
 
@@ -796,285 +785,476 @@ const adapterCallbacks: AdapterCallbacks = {
 		) {
 			return;
 		}
-		const resumeCallbackIndex = parseResumeCallback(sessionCmd);
-		const sessionCommand = parseChatSessionCommand(sessionCmd);
-		if (resumeCallbackIndex !== null || sessionCommand) {
-			const adapter = state.adapters.get(message.platform);
-			if (!rpcProcess) {
-				if (adapter) await adapter.sendMessage(message.channelId, "Agent not running.");
+		const adapterForCommand = state.adapters.get(message.platform);
+		if (/^\/help$/i.test(sessionCmd)) {
+			await adapterForCommand?.sendMessage(message.channelId, CHAT_HELP);
+			return;
+		}
+		if (/^\/(stop|abort)$/i.test(sessionCmd)) {
+			const turn = activeChatTurn;
+			if (!turn || turn.kind !== "prompt") {
+				await adapterForCommand?.sendMessage(message.channelId, "当前没有正在执行的聊天任务。");
 				return;
 			}
-			const resumeIndex =
-				resumeCallbackIndex !== null
-					? resumeCallbackIndex
-					: sessionCommand?.name === "resume" && sessionCommand.index
-						? sessionCommand.index - 1
-						: null;
-			if (resumeCallbackIndex !== null || sessionCommand?.name === "resume") {
-				if (!isAdmin(message.platform as Platform, message.userId)) {
-					if (adapter) {
-						await adapter.sendMessage(
-							message.channelId,
-							"Only admins can resume a session.",
-						);
-					}
-					return;
-				}
-				if (resumeIndex !== null) {
-					let choice = takeResumeChoice(
-						message.platform,
-						message.channelId,
-						resumeIndex,
-					);
-					if (choice.ok === false) {
-						const sessions = listRecentSessions({
-							rpcSessionDir: join(GATEWAY_CONFIG_DIR, "rpc-sessions"),
-						});
-						if (resumeIndex >= 0 && resumeIndex < sessions.length) {
-							choice = { ok: true, sessionFile: sessions[resumeIndex].sessionFile };
-						}
-					}
-					if (choice.ok === false) {
-						if (adapter) await adapter.sendMessage(message.channelId, choice.error);
-						return;
-					}
-					try {
-						await switchRpcSession(choice.sessionFile);
-						setChannelBinding(
-							message.platform,
-							message.channelId,
-							choice.sessionFile,
-						);
-						const age = sessionFileAgeMs(choice.sessionFile);
-						if (adapter) {
-							await adapter.sendMessage(
-								message.channelId,
-								buildResumeAttachedMessage(
-									choice.sessionFile,
-									age !== null && age < 15_000,
-								),
-							);
-						}
-					} catch (error) {
-						logger.error("[gateway] Failed to resume session:", error);
-						if (adapter) {
-							await adapter.sendMessage(
-								message.channelId,
-								`Failed to resume: ${error instanceof Error ? error.message : String(error)}`,
-							);
-						}
-					}
-					return;
-				}
-				const active = readActiveSession();
-				const bound = getChannelBinding(message.platform, message.channelId);
-				const sessions = listRecentSessions({
-					rpcSessionDir: join(GATEWAY_CONFIG_DIR, "rpc-sessions"),
-					boundFile: bound?.sessionFile ?? null,
-					activeFile: active?.sessionFile ?? null,
-				});
-				rememberResumeList(
-					message.platform,
-					message.channelId,
-					sessions.map((session) => session.sessionFile),
-				);
-				const listText = formatResumeList(sessions, {
-					boundFile: bound?.sessionFile ?? null,
-					activeFile: active?.sessionFile ?? null,
-				});
-				if (adapter) {
-					const withButtons = adapter as {
-						sendButtons?: (
-							ch: string,
-							text: string,
-							btns: Array<Array<{ text: string; data: string }>>,
-						) => Promise<string>;
-					};
-					const buttons = resumeButtons(sessions);
-					if (withButtons.sendButtons && buttons.length > 0) {
-						await withButtons.sendButtons(
-							message.channelId,
-							listText,
-							buttons,
-						);
-					} else {
-						await adapter.sendMessage(message.channelId, listText);
-					}
-				}
+			if (!ownsChatTurn(turn.message, message) && !isAdmin(message.platform as Platform, message.userId)) {
+				await adapterForCommand?.sendMessage(message.channelId, "只有任务发起者或管理员可以停止当前任务。");
 				return;
 			}
-			if (!sessionCommand) return;
-			if (sessionCommand.name === "session") {
-				const active = readActiveSession();
-				const bound = getChannelBinding(message.platform, message.channelId);
-				if (adapter) {
-					await adapter.sendMessage(
-						message.channelId,
-						buildSessionStatusMessage({
-							boundFile: bound?.sessionFile ?? null,
-							active,
-						}),
-					);
-				}
-				return;
-			}
-			if (sessionCommand.name === "new" && sessionCommand.path) {
-				if (!isAdmin(message.platform as Platform, message.userId)) {
-					if (adapter) {
-						await adapter.sendMessage(
-							message.channelId,
-							"Only admins can start a conversation in another folder.",
-						);
-					}
-					return;
-				}
-				const resolved = resolveSessionCwd(sessionCommand.path);
-				if (resolved.ok === false) {
-					if (adapter) await adapter.sendMessage(message.channelId, resolved.error);
-					return;
-				}
-				try {
-					const sessionFile = createProjectSessionFile(resolved.cwd);
-					await switchRpcSession(sessionFile);
-					setChannelBinding(message.platform, message.channelId, sessionFile);
-					if (adapter) {
-						await adapter.sendMessage(
-							message.channelId,
-							buildNewSessionMessage({ sessionFile, cwd: resolved.cwd }),
-						);
-					}
-				} catch (error) {
-					logger.error("[gateway] Failed to start a session in a new folder:", error);
-					if (adapter) {
-						await adapter.sendMessage(
-							message.channelId,
-							`Failed to start: ${error instanceof Error ? error.message : String(error)}`,
-						);
-					}
-				}
-				return;
-			}
-			if (sessionCommand.name === "detach" || sessionCommand.name === "new") {
-				clearChannelBinding(message.platform, message.channelId);
-				try {
-					await resetRpcSession();
-				} catch (error) {
-					logger.error("[gateway] Failed to start a new session:", error);
-				}
-				if (adapter) {
-					await adapter.sendMessage(
-						message.channelId,
-						sessionCommand.name === "new"
-							? "Started a new isolated conversation."
-							: "Detached. This chat is back on an isolated gateway session.",
-					);
-				}
-				return;
-			}
-			if (!isAdmin(message.platform as Platform, message.userId)) {
-				if (adapter) {
-					await adapter.sendMessage(
-						message.channelId,
-						"Only admins can attach this chat to the desktop Pi session.",
-					);
-				}
-				return;
-			}
-			const active = readActiveSession();
-			if (!active) {
-				if (adapter) {
-					await adapter.sendMessage(
-						message.channelId,
-						"No desktop session found. Open Pi on the machine first so the gateway can publish it.",
-					);
-				}
-				return;
-			}
+			turn.stopping = true;
+			turn.reply?.stopping();
+			cleanupPendingUiRequests();
 			try {
-				await switchRpcSession(active.sessionFile);
-				setChannelBinding(message.platform, message.channelId, active.sessionFile);
-				const age = sessionFileAgeMs(active.sessionFile);
-				if (adapter) {
-					await adapter.sendMessage(
-						message.channelId,
-						buildContinueMessage({
-							active,
-							hot: age !== null && age < 15_000,
-						}),
-					);
+				if (isAgentBusy()) {
+					const result = await sendRpc("abort") as { success: boolean; error?: string };
+					if (!result.success) throw new Error(result.error || "停止请求失败");
 				}
+				if (!message.metadata?.stopButton) await adapterForCommand?.sendMessage(message.channelId, "🛑 已请求停止，本轮结束后可以继续发消息。");
 			} catch (error) {
-				logger.error("[gateway] Failed to continue session:", error);
-				if (adapter) {
-					await adapter.sendMessage(
-						message.channelId,
-						`Failed to attach: ${error instanceof Error ? error.message : String(error)}`,
-					);
-				}
+				turn.stopping = false;
+				turn.reply?.cancelStop();
+				await adapterForCommand?.sendMessage(message.channelId, "❌ 停止失败，请稍后再试，或让管理员 /restart。");
 			}
 			return;
 		}
-
-		const boundSession = getChannelBinding(message.platform, message.channelId);
-		if (boundSession && rpcProcess) {
-			try {
-				await switchRpcSession(boundSession.sessionFile);
-			} catch (error) {
-				logger.error("[gateway] Bound session switch failed:", error);
-				const adapter = state.adapters.get(message.platform);
-				if (adapter) {
-					await adapter.sendMessage(
-						message.channelId,
-						`Could not reopen the attached session: ${error instanceof Error ? error.message : String(error)}`,
-					);
+		const privilegedRestart = /^\/restart$/i.test(sessionCmd) && isAdmin(message.platform as Platform, message.userId);
+		const readOnlySession = /^\/session$/i.test(sessionCmd);
+		if ((activeChatTurn || isAgentBusy()) && !privilegedRestart && !readOnlySession) {
+			const turn = activeChatTurn;
+			if (turn?.kind === "prompt" && !turn.stopping && ownsChatTurn(turn.message, message) && !sessionCmd.startsWith("/") && !sessionCmd.startsWith("Callback:")) {
+				try {
+					if (isAgentBusy()) await sendSteerRpc(message.content);
+					else turn.queued.push(message.content);
+					await adapterForCommand?.sendMessage(message.channelId, "↪️ 已收到补充要求，本轮会按这个调整。");
+				} catch (error) {
+					await adapterForCommand?.sendMessage(message.channelId, "❌ 补充要求未提交，请等当前任务结束后重试。");
 				}
-				return;
-			}
+			} else await adapterForCommand?.sendMessage(message.channelId, "⏳ 当前任务还在执行，请结束后再操作。任务发起者可补充要求或使用 /stop。");
+			return;
 		}
-
-		// ── Admin/allowed model commands ──
-		const modelMatch = message.content.match(/^\/model(?:\s+(.+))?/i);
-		const modelCallback = message.content.match(/^Callback:\s*model:(.+)/i);
-
-		if (
-			(modelMatch || modelCallback) &&
-			isUserAllowed(message.platform as Platform, message.userId)
-		) {
-			const adapter = state.adapters.get(message.platform);
-			if (!rpcProcess) {
-				if (adapter) {
-					await adapter.sendMessage(message.channelId, "Agent not running.");
+		// Reserve synchronously before session switching or Discord REST awaits.
+		const isGatewayCommand = !!parseChatSessionCommand(sessionCmd) || /^\/model(?:\s|$)/i.test(sessionCmd) || /^\/restart$/i.test(sessionCmd) || sessionCmd.startsWith("Callback:");
+		const reservedTurn = activeChatTurn ? null : {
+			message, kind: isGatewayCommand ? "command" as const : "prompt" as const,
+			stopping: false, queued: [] as string[], reply: undefined as ChatReply | undefined,
+		};
+		if (reservedTurn) activeChatTurn = reservedTurn;
+		try {
+			const resumeCallbackIndex = parseResumeCallback(sessionCmd);
+			const sessionCommand = parseChatSessionCommand(sessionCmd);
+			if (resumeCallbackIndex !== null || sessionCommand) {
+				const adapter = state.adapters.get(message.platform);
+				if (!rpcProcess) {
+					if (adapter) await adapter.sendMessage(message.channelId, "Agent not running.");
+					return;
 				}
-				return;
-			}
-
-			// Handle callback from inline keyboard
-			if (modelCallback) {
-				const key = modelCallback[1].trim();
-				const parsed = parseModelKey(key);
-				if (!parsed) return;
-				const { provider, modelId } = parsed;
-
-				// Only admins can actually switch models
-				if (!isAdmin(message.platform as Platform, message.userId)) {
+				const resumeIndex =
+					resumeCallbackIndex !== null
+						? resumeCallbackIndex
+						: sessionCommand?.name === "resume" && sessionCommand.index
+							? sessionCommand.index - 1
+							: null;
+				if (resumeCallbackIndex !== null || sessionCommand?.name === "resume") {
+					if (!isAdmin(message.platform as Platform, message.userId)) {
+						if (adapter) {
+							await adapter.sendMessage(
+								message.channelId,
+								"Only admins can resume a session.",
+							);
+						}
+						return;
+					}
+					if (resumeIndex !== null) {
+						let choice = takeResumeChoice(
+							message.platform,
+							message.channelId,
+							resumeIndex,
+							Date.now(),
+							typeof message.metadata?.callbackMessageId === "string" ? message.metadata.callbackMessageId : undefined,
+						);
+						if (choice.ok === false && resumeCallbackIndex === null) {
+							const sessions = listRecentSessions({
+								rpcSessionDir: join(GATEWAY_CONFIG_DIR, "rpc-sessions"),
+							});
+							if (resumeIndex >= 0 && resumeIndex < sessions.length) {
+								choice = { ok: true, sessionFile: sessions[resumeIndex].sessionFile };
+							}
+						}
+						if (choice.ok === false) {
+							if (adapter) await adapter.sendMessage(message.channelId, choice.error);
+							return;
+						}
+						try {
+							await switchRpcSession(choice.sessionFile);
+							setChannelBinding(
+								message.platform,
+								message.channelId,
+								choice.sessionFile,
+							);
+							const age = sessionFileAgeMs(choice.sessionFile);
+							if (adapter) {
+								await adapter.sendMessage(
+									message.channelId,
+									buildResumeAttachedMessage(
+										choice.sessionFile,
+										age !== null && age < 15_000,
+									),
+								);
+							}
+						} catch (error) {
+							logger.error("[gateway] Failed to resume session:", error);
+							if (adapter) {
+								await adapter.sendMessage(
+									message.channelId,
+									`Failed to resume: ${error instanceof Error ? error.message : String(error)}`,
+								);
+							}
+						}
+						return;
+					}
+					const active = readActiveSession();
+					const bound = getChannelBinding(message.platform, message.channelId);
+					const sessions = listRecentSessions({
+						rpcSessionDir: join(GATEWAY_CONFIG_DIR, "rpc-sessions"),
+						boundFile: bound?.sessionFile ?? null,
+						activeFile: active?.sessionFile ?? null,
+					});
+					rememberResumeList(
+						message.platform,
+						message.channelId,
+						sessions.map((session) => session.sessionFile),
+					);
+					const listText = formatResumeList(sessions, {
+						boundFile: bound?.sessionFile ?? null,
+						activeFile: active?.sessionFile ?? null,
+					});
+					if (adapter) {
+						const withButtons = adapter as {
+							sendButtons?: (
+								ch: string,
+								text: string,
+								btns: Array<Array<{ text: string; data: string }>>,
+								ownerUserId?: string,
+							) => Promise<string>;
+						};
+						const buttons = resumeButtons(sessions);
+						if (withButtons.sendButtons && buttons.length > 0) {
+							const pickerId = await withButtons.sendButtons(
+								message.channelId,
+								listText,
+								buttons,
+								message.userId,
+							);
+							if (message.platform === "discord") rememberResumeList(message.platform, message.channelId, sessions.map((session) => session.sessionFile), Date.now(), pickerId);
+						} else {
+							await adapter.sendMessage(message.channelId, listText);
+						}
+					}
+					return;
+				}
+				if (!sessionCommand) return;
+				if (sessionCommand.name === "session") {
+					const active = readActiveSession();
+					const bound = getChannelBinding(message.platform, message.channelId);
 					if (adapter) {
 						await adapter.sendMessage(
 							message.channelId,
-							"Only admins can switch models.",
+							buildSessionStatusMessage({
+								boundFile: bound?.sessionFile ?? (existsSync(gatewaySessionFile(session.id)) ? gatewaySessionFile(session.id) : null),
+								active,
+							}),
 						);
 					}
 					return;
 				}
+				if (sessionCommand.name === "new" && sessionCommand.path) {
+					if (!isAdmin(message.platform as Platform, message.userId)) {
+						if (adapter) {
+							await adapter.sendMessage(
+								message.channelId,
+								"Only admins can start a conversation in another folder.",
+							);
+						}
+						return;
+					}
+					const resolved = resolveSessionCwd(sessionCommand.path);
+					if (resolved.ok === false) {
+						if (adapter) await adapter.sendMessage(message.channelId, resolved.error);
+						return;
+					}
+					try {
+						const sessionFile = createProjectSessionFile(resolved.cwd);
+						await switchRpcSession(sessionFile);
+						setChannelBinding(message.platform, message.channelId, sessionFile);
+						if (adapter) {
+							await adapter.sendMessage(
+								message.channelId,
+								buildNewSessionMessage({ sessionFile, cwd: resolved.cwd }),
+							);
+						}
+					} catch (error) {
+						logger.error("[gateway] Failed to start a session in a new folder:", error);
+						if (adapter) {
+							await adapter.sendMessage(
+								message.channelId,
+								`Failed to start: ${error instanceof Error ? error.message : String(error)}`,
+							);
+						}
+					}
+					return;
+				}
+				if (sessionCommand.name === "detach" || sessionCommand.name === "new") {
+					try {
+						if (sessionCommand.name === "new") deleteSession(session.id);
+						const isolated = getOrCreateSession(message.platform, message.channelId, message.userId, config.sessions);
+						const file = ensureGatewaySessionFile(isolated);
+						await switchRpcSession(file);
+						clearChannelBinding(message.platform, message.channelId);
+						state.sessions.set(`${message.platform}:${message.channelId}`, isolated);
+						await adapter?.sendMessage(message.channelId, buildNewSessionMessage({ sessionFile: file }));
+					} catch (error) {
+						logger.error("[gateway] Failed to open isolated session:", error);
+						await adapter?.sendMessage(message.channelId, "❌ 切换会话失败，请稍后重试。");
+					}
+					return;
+				}
+				if (!isAdmin(message.platform as Platform, message.userId)) {
+					if (adapter) {
+						await adapter.sendMessage(
+							message.channelId,
+							"Only admins can attach this chat to the desktop Pi session.",
+						);
+					}
+					return;
+				}
+				const active = readActiveSession();
+				if (!active) {
+					if (adapter) {
+						await adapter.sendMessage(
+							message.channelId,
+							"No desktop session found. Open Pi on the machine first so the gateway can publish it.",
+						);
+					}
+					return;
+				}
+				try {
+					await switchRpcSession(active.sessionFile);
+					setChannelBinding(message.platform, message.channelId, active.sessionFile);
+					const age = sessionFileAgeMs(active.sessionFile);
+					if (adapter) {
+						await adapter.sendMessage(
+							message.channelId,
+							buildContinueMessage({
+								active,
+								hot: age !== null && age < 15_000,
+							}),
+						);
+					}
+				} catch (error) {
+					logger.error("[gateway] Failed to continue session:", error);
+					if (adapter) {
+						await adapter.sendMessage(
+							message.channelId,
+							`Failed to attach: ${error instanceof Error ? error.message : String(error)}`,
+						);
+					}
+				}
+				return;
+			}
+
+			const boundSession = getChannelBinding(message.platform, message.channelId);
+			if (boundSession && rpcProcess) {
+				try {
+					await switchRpcSession(boundSession.sessionFile);
+				} catch (error) {
+					logger.error("[gateway] Bound session switch failed:", error);
+					const adapter = state.adapters.get(message.platform);
+					if (adapter) {
+						await adapter.sendMessage(
+							message.channelId,
+							`Could not reopen the attached session: ${error instanceof Error ? error.message : String(error)}`,
+						);
+					}
+					return;
+				}
+			}
+
+			// ── Admin/allowed model commands ──
+			const modelMatch = sessionCmd.match(/^\/model(?:\s+(.+))?$/i);
+			const modelCallback = message.content.match(/^Callback:\s*model:(.+)/i);
+
+			if (
+				(modelMatch || modelCallback) &&
+				isUserAllowed(message.platform as Platform, message.userId)
+			) {
+				const adapter = state.adapters.get(message.platform);
+				if (!rpcProcess) {
+					if (adapter) {
+						await adapter.sendMessage(message.channelId, "Agent not running.");
+					}
+					return;
+				}
+
+				// Handle callback from inline keyboard
+				if (modelCallback) {
+					const key = modelCallback[1].trim();
+					const parsed = parseModelKey(key);
+					if (!parsed) return;
+					const { provider, modelId } = parsed;
+
+					// Only admins can actually switch models
+					if (!isAdmin(message.platform as Platform, message.userId)) {
+						if (adapter) {
+							await adapter.sendMessage(
+								message.channelId,
+								"Only admins can switch models.",
+							);
+						}
+						return;
+					}
+
+					try {
+						const result = (await sendRpc("set_model", {
+							provider,
+							modelId,
+						})) as {
+							success: boolean;
+							error?: string;
+							data?: { name: string };
+						};
+						if (result.success) {
+							const name = result.data?.name || `${provider}/${modelId}`;
+							if (adapter) {
+								await adapter.sendMessage(
+									message.channelId,
+									`✅ Model changed to ${name}`,
+								);
+							}
+							logger.info(
+								`[gateway] Admin ${message.userId} switched model to ${provider}/${modelId}`,
+							);
+						} else {
+							if (adapter) {
+								await adapter.sendMessage(
+									message.channelId,
+									`❌ Failed: ${result.error || "unknown"}`,
+								);
+							}
+						}
+					} catch (err) {
+						logger.error("[gateway] Model switch failed:", err);
+					}
+					return;
+				}
+
+				const arg = (modelMatch?.[1] || "").trim();
+				const normalizedArg = arg.toLowerCase();
+
+				// /model (no args) or /model list → show available models
+				if (!arg || normalizedArg === "list") {
+					try {
+						const result = (await sendRpc("get_available_models")) as {
+							success: boolean;
+							data?: {
+								models: Array<{
+									provider: string;
+									id: string;
+									name: string;
+								}>;
+							};
+						};
+						if (result.success && result.data) {
+							const models = result.data.models;
+
+							// Try inline keyboard for Telegram
+							const telegram = adapter as unknown as {
+								sendButtons?: (
+									ch: string,
+									text: string,
+									btns: Array<Array<{ text: string; data: string }>>,
+								) => Promise<string>;
+							};
+							const discord = adapter as {
+								platform: string;
+								sendModelPicker?: (
+									ch: string,
+									ownerUserId: string,
+									models: CatalogModel[],
+								) => Promise<string>;
+							};
+							if (adapter && discord.platform === "discord" && discord.sendModelPicker) {
+								await discord.sendModelPicker(
+									message.channelId,
+									message.userId,
+									models,
+								);
+							} else if (
+								adapter &&
+								modelListUsesInlineButtons(adapter.platform) &&
+								telegram.sendButtons
+							) {
+								const buttons = models.map((m) => [
+									{
+										text: `${m.name} (${m.provider})`,
+										data: `model:${m.provider}/${m.id}`,
+									},
+								]);
+								await telegram.sendButtons(
+									message.channelId,
+									"<b>Available models</b>\nTap to switch:",
+									buttons,
+								);
+							} else if (adapter) {
+								await adapter.sendMessage(
+									message.channelId,
+									formatModelListText(models),
+								);
+							}
+						} else if (adapter) {
+							await adapter.sendMessage(
+								message.channelId,
+								"Could not retrieve model list from the agent.",
+							);
+						}
+					} catch (err) {
+						logger.error("[gateway] Failed to list models:", err);
+						if (adapter) {
+							await adapter.sendMessage(
+								message.channelId,
+								"Failed to send the model list to Discord. Try /model again in a few seconds.",
+							);
+						}
+					}
+					return;
+				}
+
+				// /model provider/modelId — only admins can switch
+				if (!isAdmin(message.platform as Platform, message.userId)) {
+					if (adapter) {
+						await adapter.sendMessage(
+							message.channelId,
+							"Only admins can switch models. Use `/model` to see available models.",
+						);
+					}
+					return;
+				}
+
+				const parsed = parseModelKey(arg);
+				if (!parsed) {
+					if (adapter) {
+						await adapter.sendMessage(
+							message.channelId,
+							"Usage: `/model provider/modelId`\n`/model` to see available models.",
+						);
+					}
+					return;
+				}
+				const { provider, modelId } = parsed;
 
 				try {
 					const result = (await sendRpc("set_model", {
 						provider,
 						modelId,
-					})) as {
-						success: boolean;
-						error?: string;
-						data?: { name: string };
-					};
+					})) as { success: boolean; error?: string; data?: { name: string } };
 					if (result.success) {
 						const name = result.data?.name || `${provider}/${modelId}`;
 						if (adapter) {
@@ -1095,442 +1275,119 @@ const adapterCallbacks: AdapterCallbacks = {
 						}
 					}
 				} catch (err) {
-					logger.error("[gateway] Model switch failed:", err);
+					logger.error("[gateway] Failed to change model:", err);
+					if (adapter) {
+						await adapter.sendMessage(
+							message.channelId,
+							"Failed to change model.",
+						);
+					}
 				}
 				return;
 			}
 
-			const arg = (modelMatch?.[1] || "").trim();
-			const normalizedArg = arg.toLowerCase();
-
-			// /model (no args) or /model list → show available models
-			if (!arg || normalizedArg === "list") {
-				try {
-					const result = (await sendRpc("get_available_models")) as {
-						success: boolean;
-						data?: {
-							models: Array<{
-								provider: string;
-								id: string;
-								name: string;
-							}>;
-						};
-					};
-					if (result.success && result.data) {
-						const models = result.data.models;
-
-						// Try inline keyboard for Telegram
-						const telegram = adapter as unknown as {
-							sendButtons?: (
-								ch: string,
-								text: string,
-								btns: Array<Array<{ text: string; data: string }>>,
-							) => Promise<string>;
-						};
-						const discord = adapter as {
-							platform: string;
-							sendModelPicker?: (
-								ch: string,
-								ownerUserId: string,
-								models: CatalogModel[],
-							) => Promise<string>;
-						};
-						if (adapter && discord.platform === "discord" && discord.sendModelPicker) {
-							await discord.sendModelPicker(
+			// ── Admin restart command ──
+			if (/^\/restart$/i.test(message.content.trim())) {
+				if (!isAdmin(message.platform as Platform, message.userId)) {
+					await state.adapters.get(message.platform)?.sendMessage(message.channelId, "只有管理员可以重启网关。");
+					return;
+				} else if (IS_DAEMON) {
+					// Restart listeners, adapters, and the RPC child in-process. Sending
+					// SIGHUP to self terminates Node abruptly on Windows.
+					const adapter = state.adapters.get(message.platform);
+					if (adapter) {
+						await adapter.sendMessage(
+							message.channelId,
+							"♻️ Restarting gateway runtime…",
+						);
+					}
+					try {
+						await restartDaemonRuntime();
+						logger.info(`[gateway] Admin ${message.userId} restarted gateway runtime`);
+					} catch (error) {
+						logger.error("[gateway] Failed to restart gateway runtime:", error);
+						const activeAdapter = state.adapters.get(message.platform);
+						if (activeAdapter) {
+							await activeAdapter.sendMessage(
 								message.channelId,
-								message.userId,
-								models,
-							);
-						} else if (
-							adapter &&
-							modelListUsesInlineButtons(adapter.platform) &&
-							telegram.sendButtons
-						) {
-							const buttons = models.map((m) => [
-								{
-									text: `${m.name} (${m.provider})`,
-									data: `model:${m.provider}/${m.id}`,
-								},
-							]);
-							await telegram.sendButtons(
-								message.channelId,
-								"<b>Available models</b>\nTap to switch:",
-								buttons,
-							);
-						} else if (adapter) {
-							await adapter.sendMessage(
-								message.channelId,
-								formatModelListText(models),
+								"❌ Gateway runtime restart failed. Check the daemon log.",
 							);
 						}
-					} else if (adapter) {
-						await adapter.sendMessage(
-							message.channelId,
-							"Could not retrieve model list from the agent.",
-						);
 					}
-				} catch (err) {
-					logger.error("[gateway] Failed to list models:", err);
-					if (adapter) {
-						await adapter.sendMessage(
-							message.channelId,
-							"Failed to send the model list to Discord. Try /model again in a few seconds.",
-						);
-					}
-				}
-				return;
-			}
-
-			// /model provider/modelId — only admins can switch
-			if (!isAdmin(message.platform as Platform, message.userId)) {
-				if (adapter) {
-					await adapter.sendMessage(
-						message.channelId,
-						"Only admins can switch models. Use `/model` to see available models.",
-					);
-				}
-				return;
-			}
-
-			const parsed = parseModelKey(arg);
-			if (!parsed) {
-				if (adapter) {
-					await adapter.sendMessage(
-						message.channelId,
-						"Usage: `/model provider/modelId`\n`/model` to see available models.",
-					);
-				}
-				return;
-			}
-			const { provider, modelId } = parsed;
-
-			try {
-				const result = (await sendRpc("set_model", {
-					provider,
-					modelId,
-				})) as { success: boolean; error?: string; data?: { name: string } };
-				if (result.success) {
-					const name = result.data?.name || `${provider}/${modelId}`;
-					if (adapter) {
-						await adapter.sendMessage(
-							message.channelId,
-							`✅ Model changed to ${name}`,
-						);
-					}
-					logger.info(
-						`[gateway] Admin ${message.userId} switched model to ${provider}/${modelId}`,
-					);
+					return;
 				} else {
+					const adapter = state.adapters.get(message.platform);
 					if (adapter) {
 						await adapter.sendMessage(
 							message.channelId,
-							`❌ Failed: ${result.error || "unknown"}`,
+							"♻️ Restarting pi agent…",
 						);
 					}
-				}
-			} catch (err) {
-				logger.error("[gateway] Failed to change model:", err);
-				if (adapter) {
-					await adapter.sendMessage(
-						message.channelId,
-						"Failed to change model.",
-					);
-				}
-			}
-			return;
-		}
 
-		// ── Admin restart command ──
-		if (/^\/restart$/i.test(message.content.trim())) {
-			if (!isAdmin(message.platform as Platform, message.userId)) {
-				// Non-admin: let pi handle it as a normal prompt
-			} else if (IS_DAEMON) {
-				// Restart listeners, adapters, and the RPC child in-process. Sending
-				// SIGHUP to self terminates Node abruptly on Windows.
-				const adapter = state.adapters.get(message.platform);
-				if (adapter) {
-					await adapter.sendMessage(
-						message.channelId,
-						"♻️ Restarting gateway runtime…",
-					);
-				}
-				try {
-					await restartDaemonRuntime();
-					logger.info(`[gateway] Admin ${message.userId} restarted gateway runtime`);
-				} catch (error) {
-					logger.error("[gateway] Failed to restart gateway runtime:", error);
-					const activeAdapter = state.adapters.get(message.platform);
-					if (activeAdapter) {
-						await activeAdapter.sendMessage(
+					// Kill and restart the pi RPC process
+					if (rpcProcess) {
+						rpcProcess.kill();
+						rpcProcess = null;
+					}
+					rejectPendingRpc(new Error("Agent restarted by admin"));
+					rpcProcess = createRpcProcess();
+
+					logger.info(`[gateway] Admin ${message.userId} restarted pi agent`);
+
+					if (adapter) {
+						await adapter.sendMessage(
 							message.channelId,
-							"❌ Gateway runtime restart failed. Check the daemon log.",
+							"✅ Pi agent restarted.",
 						);
 					}
+					return;
 				}
-				return;
-			} else {
-				const adapter = state.adapters.get(message.platform);
-				if (adapter) {
-					await adapter.sendMessage(
-						message.channelId,
-						"♻️ Restarting pi agent…",
-					);
-				}
-
-				// Kill and restart the pi RPC process
-				if (rpcProcess) {
-					rpcProcess.kill();
-					rpcProcess = null;
-				}
-				// Reject any pending completions
-				rpcTurnActive = false;
-				while (pendingCompletions.length > 0) {
-					const c = pendingCompletions.shift()!;
-					c.reject(new Error("Agent restarted by admin"));
-				}
-				rpcProcess = createRpcProcess();
-
-				logger.info(`[gateway] Admin ${message.userId} restarted pi agent`);
-
-				if (adapter) {
-					await adapter.sendMessage(
-						message.channelId,
-						"✅ Pi agent restarted.",
-					);
-				}
-				return;
 			}
-		}
 
-		// Send to pi agent with tool policy guard
-		if (rpcProcess) {
+			// One reply lifecycle owns all preview edits and the final delivery.
 			const adapter = state.adapters.get(message.platform);
-			const guard = buildPolicyGuard(message.platform, message.userId);
-
-			if (routeChatMessage(isAgentBusy()) === "steer") {
-				try {
-					logger.info(
-						`[gateway] Steering from ${message.platform}/${message.userId}`,
-					);
-					await sendSteerRpc(message.content);
-					if (adapter) {
-						await adapter.sendMessage(
-							message.channelId,
-							"↪️ 已加入引导。当前这轮工具跑完后会按这个调整。",
-						);
-					}
-					return;
-				} catch (err) {
-					logger.warn(
-						"[gateway] Steer failed, falling back to a new prompt:",
-						err,
-					);
-				}
+			if (!rpcProcess) {
+				await adapter?.sendMessage(message.channelId, "❌ Pi 当前未运行，请联系管理员启动网关。");
+				return;
 			}
-
-			// Send an initial placeholder message so we can stream edits into it
-			let sentId: string | undefined;
-			if (adapter) {
-				try {
-					await adapter.setTyping(message.channelId, true);
-					sentId = await adapter.sendMessage(message.channelId, "⏳ Thinking…");
-				} catch {
-					// If sendMessage itself fails, don't even try to process
-					logger.error("[gateway] Failed to send initial placeholder message");
-					return;
-				}
-			}
-
-			// Keep the typing indicator alive while waiting for a response.
-			// Telegram's typing action lasts ~5s, so send a heartbeat every 4s.
-			let typingInterval: ReturnType<typeof setInterval> | undefined;
-			if (adapter) {
-				typingInterval = setInterval(() => {
-					adapter!.setTyping(message.channelId, true).catch(() => {});
-				}, 4000);
-			}
-
-			// Track which channel triggered this prompt for UI request routing
-			setActiveChannel({
-				platform: message.platform,
-				channelId: message.channelId,
-				userId: message.userId,
-			});
-
-			let preText = "";
-
-			// When extension_ui_request arrives (select prompt about to show),
-			// flush full accumulated text into the placeholder
-			setFlushHandler(() => {
-				if (!adapter) return;
-				const completion = pendingCompletions[0];
-				if (completion?.streamedText && sentId) {
-					preText = completion.streamedText;
-					adapter
-						.editMessage(message.channelId, sentId, completion.streamedText)
-						.catch(() => {});
-				}
-			});
-			// When user clicks (via handleInteractiveResponse), invalidate
-			// old placeholder and redirect to fresh message
-			setStreamRedirectHandler(() => {
-				if (!adapter) return;
-				const completion = pendingCompletions[0];
-				if (completion) completion.streamedText = "";
-				sentId = undefined;
-				adapter
-					.sendMessage(message.channelId, "⏳ Thinking…")
-					.then((newId) => {
-						sentId = newId;
-					})
-					.catch(() => {});
-			});
-
+			const turn = reservedTurn;
+			if (!turn) return;
+			const reply = adapter ? new ChatReply(adapter, message) : undefined;
+			turn.reply = reply;
 			try {
-				logger.info(
-					`[gateway] Sending prompt from ${message.platform}/${message.userId} (session: ${session.id.slice(0, 12)}...)`,
-				);
-
-				// Stream deltas into the placeholder message, then wait for agent_end
-				let lastEditTime = 0;
-				const EDIT_THROTTLE_MS = 400; // max 2.5 edits/sec to avoid rate limits
-				const responseText = await sendPromptRpc(
-					`${guard}\n\n${message.content}`,
-					adapter && sentId
-						? (streamText: string) => {
-								const now = Date.now();
-								const currentId = sentId;
-								if (currentId && now - lastEditTime >= EDIT_THROTTLE_MS) {
-									lastEditTime = now;
-									adapter
-										.editMessage(message.channelId, currentId, streamText)
-										.catch(() => {});
-								}
-							}
-						: undefined,
-					adapter && sentId
-						? (elapsedMs: number) => {
-								const currentId = sentId;
-								if (!currentId) return;
-								const notice = stillWorkingNotice(elapsedMs);
-								const streamed = pendingCompletions[0]?.streamedText?.trim();
-								const body = streamed ? `${streamed}\n\n${notice}` : notice;
-								adapter
-									.editMessage(
-										message.channelId,
-										currentId,
-										body.length > 2000 ? `${body.slice(0, 1985)}…` : body,
-									)
-									.catch(() => {});
-							}
-						: undefined,
-				);
-
-				logger.info(
-					`[gateway] Response received, length: ${responseText.length}, sending back to ${message.platform}/${message.channelId}`,
-				);
-
-				if (responseText && adapter) {
-					// Walk char-by-char to strip pre-question text from the full
-					// agent_end response when a flush happened
-					let finalText = responseText;
-					if (preText) {
-						let pos = 0;
-						while (
-							pos < preText.length &&
-							pos < responseText.length &&
-							preText[pos] === responseText[pos]
-						) {
-							pos++;
-						}
-						if (pos >= preText.length) {
-							finalText = responseText.slice(pos).trim();
-						}
-					}
-					if (sentId) {
-						if (finalText) {
-							try {
-								await adapter.editMessage(message.channelId, sentId, finalText);
-							} catch (err) {
-								logger.warn(
-									"[gateway] Failed to edit response message, sending a new one:",
-									err,
-								);
-								await adapter.sendMessage(message.channelId, finalText);
-							}
-						}
-					} else {
-						if (finalText) {
-							await adapter.sendMessage(message.channelId, finalText);
-						} else {
-							logger.warn(
-								"[gateway] Response text was empty after flush stripping - nothing new to send",
-							);
-						}
-					}
-					clearInterval(typingInterval);
-					await adapter.setTyping(message.channelId, false);
-					logger.info("[gateway] Response sent to platform successfully");
-				} else if (!responseText && adapter) {
-					logger.warn("[gateway] Response text was empty — nothing to send");
-					if (sentId) {
-						await adapter.editMessage(
-							message.channelId,
-							sentId,
-							"I processed your message but had no text response. Please try again.",
-						);
-					} else {
-						await adapter.sendMessage(
-							message.channelId,
-							"I processed your message but had no text response. Please try again.",
-						);
-					}
-					clearInterval(typingInterval);
-					await adapter.setTyping(message.channelId, false);
-				}
-			} catch (err) {
-				logger.error("[gateway] RPC error processing message:", err);
-				clearInterval(typingInterval);
-				if (adapter && isAgentAlreadyProcessingError(err)) {
-					try {
-						await sendSteerRpc(message.content);
-						const queued =
-							"↪️ 上一轮还在跑，这条已作为引导加入。结束后会按这个调整。";
-						if (sentId) {
-							await adapter.editMessage(message.channelId, sentId, queued);
-						} else {
-							await adapter.sendMessage(message.channelId, queued);
-						}
-						await adapter.setTyping(message.channelId, false);
-						return;
-					} catch (steerErr) {
-						logger.warn("[gateway] Steer fallback after already-processing failed:", steerErr);
-					}
-				}
-				if (adapter) {
-					try {
-						const detail =
-							err instanceof Error ? err.message.split("\n")[0] : String(err);
-						const errorMsg = isAgentAlreadyProcessingError(err)
-							? "上一轮还没结束，暂时接不了新消息。等它跑完，或用 /restart。"
-							: `Sorry, I encountered an error processing your message.\n${detail.slice(0, 180)}`;
-						if (sentId) {
-							await adapter.editMessage(message.channelId, sentId, errorMsg);
-						} else {
-							await adapter.sendMessage(message.channelId, errorMsg);
-						}
-						await adapter.setTyping(message.channelId, false);
-					} catch (sendErr) {
-						logger.error("[gateway] Failed to send error message:", sendErr);
-					}
-				}
+				await reply?.start();
+				if (turn.stopping) { await reply?.finish("", "stopped"); return; }
+				if (!boundSession) await switchRpcSession(ensureGatewaySessionFile(session));
+				if (turn.stopping) { await reply?.finish("", "stopped"); return; }
+				setActiveChannel({ platform: message.platform, channelId: message.channelId, userId: message.userId });
+				setFlushHandler(() => reply?.waitForAnswer());
+				setStreamRedirectHandler(() => reply?.resume());
+				const guard = buildPolicyGuard(message.platform, message.userId);
+				const prompt = [message.content, ...turn.queued].join("\n\n");
+				turn.queued = [];
+				const text = await sendPromptRpc(`${guard}\n\n${prompt}`,
+					(text) => reply?.stream(text), undefined, (event) => {
+						if (event.type === "message_end" && event.message?.stopReason === "aborted") turn.stopping = true;
+						reply?.event(event);
+					});
+				await reply?.finish(text, turn.stopping ? "stopped" : "success");
+			} catch (error) {
+				logger.error("[gateway] Chat turn failed:", error);
+				const detail = error instanceof Error ? error.message : String(error);
+				try { await reply?.finish(detail.slice(0, 600), "error"); }
+				catch (deliveryError) { logger.error("[gateway] Failed to deliver turn error:", deliveryError); }
+			} finally {
+				cleanupPendingUiRequests();
+				setFlushHandler(null);
+				setStreamRedirectHandler(null);
+				setActiveChannel(null);
 			}
-		} else {
-			logger.warn("[gateway] pi agent not running — cannot process message");
+		} finally {
+			if (reservedTurn && activeChatTurn === reservedTurn) activeChatTurn = null;
 		}
 	},
 	onInteractiveResponse: (response: InteractiveResponse, fromUserId?: string) => {
-		handleInteractiveResponse(response, fromUserId);
+		return handleInteractiveResponse(response, fromUserId);
 	},
 	onDisconnect: () => {
 		logger.info("[gateway] Platform adapter disconnected");
@@ -1548,6 +1405,9 @@ async function initializeAdapters(): Promise<void> {
 				platform: "discord",
 				botToken: config.platforms.discord.botToken,
 				guildId: config.platforms.discord.guildId,
+				allowedChannels: config.platforms.discord.allowedChannels,
+				requireMention: config.platforms.discord.requireMention,
+				reactions: config.platforms.discord.reactions,
 			});
 			await discord.initialize();
 			await discord.start(adapterCallbacks);
@@ -1798,10 +1658,15 @@ function handleWebSocket(ws: WebSocket, req: IncomingMessage): void {
 
 			switch (msg.type) {
 				case "prompt": {
+						if (activeChatTurn || isAgentBusy()) throw new Error("The agent is busy with another task");
+						rpcTurnActive = true;
+						try {
 					const result = await sendRpc("prompt", {
 						message: msg.data?.message || "",
 					});
 					sendWs(ws, { type: "response", id: msg.id, data: result });
+						if (!(result as any).success) rpcTurnActive = false;
+						} catch (error) { rpcTurnActive = false; throw error; }
 					break;
 				}
 				case "background": {
@@ -2846,6 +2711,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async () => {
+		await stopGatewayServer();
 		statusUpdateGeneration++;
 		if (statusRefreshInterval) clearInterval(statusRefreshInterval);
 		statusRefreshInterval = null;
@@ -3081,21 +2947,16 @@ async function stopGatewayServer(): Promise<void> {
 	if (!state?.running && !server && !rpcProcess) return;
 	state.running = false;
 
-	// Send shutdown message to all active chat channels before stopping
-	const db = initSessionStore();
-	const rows = db
-		.prepare(
-			"SELECT DISTINCT platform, channel_id FROM sessions WHERE is_background = 0",
-		)
-		.all() as Array<{ platform: string; channel_id: string }>;
-	for (const row of rows) {
-		const adapter = state.adapters.get(row.platform);
-		if (adapter) {
-			adapter
-				.sendMessage(row.channel_id, "🔌 Gateway daemon is shutting down…")
-				.catch(() => {});
-		}
+	if (activeChatTurn?.reply) {
+		activeChatTurn.stopping = true;
+		try { await activeChatTurn.reply.finish("网关正在关闭。", "stopped"); }
+		catch (error) { logger.warn("[gateway] Could not close the active reply:", error); }
 	}
+	rejectPendingRpc(new Error("Gateway stopped"));
+	cleanupPendingUiRequests();
+	setActiveChannel(null);
+	setFlushHandler(null);
+	setStreamRedirectHandler(null);
 
 	await Promise.allSettled(
 		Array.from(state.adapters.values(), (adapter) => adapter.stop()),
@@ -3125,8 +2986,9 @@ async function stopGatewayServer(): Promise<void> {
 	}
 
 	if (rpcProcess) {
-		rpcProcess.kill();
+		const oldProcess = rpcProcess;
 		rpcProcess = null;
+		oldProcess.kill();
 	}
 
 	void updateStatus();

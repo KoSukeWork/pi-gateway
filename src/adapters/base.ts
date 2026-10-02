@@ -45,6 +45,23 @@ export interface PlatformMessage {
 	metadata?: Record<string, unknown>;
 }
 
+export interface MessageEditOptions {
+	/** Streaming previews must not send overflow messages. */
+	finalize?: boolean;
+}
+
+export interface MessageDelivery {
+	partial?: boolean;
+	deliveredChunks?: number;
+	totalChunks?: number;
+}
+
+export interface InteractiveOutcome {
+	status: "answered" | "cancelled" | "expired";
+	/** Only choices/confirmations are echoed; free text can contain secrets. */
+	label?: string;
+}
+
 export interface PlatformConfig {
 	enabled: boolean;
 	platform: string;
@@ -61,7 +78,7 @@ export interface AdapterCallbacks {
 	onInteractiveResponse?: (
 		response: InteractiveResponse,
 		fromUserId?: string,
-	) => void;
+	) => boolean | void;
 }
 
 export interface PlatformAdapter {
@@ -87,6 +104,8 @@ export interface PlatformAdapter {
 	 * Send a message to a channel
 	 */
 	sendMessage(channelId: string, content: string): Promise<string>; // Returns message ID
+	sendReply?(message: PlatformMessage, content: string): Promise<string>;
+	setMessageReaction?(channelId: string, messageId: string, emoji: string, enabled: boolean): Promise<void>;
 
 	/**
 	 * Edit an existing message
@@ -95,7 +114,8 @@ export interface PlatformAdapter {
 		channelId: string,
 		messageId: string,
 		content: string,
-	): Promise<void>;
+		options?: MessageEditOptions,
+	): Promise<void | MessageDelivery>;
 
 	/**
 	 * Delete a message
@@ -125,7 +145,7 @@ export interface PlatformAdapter {
 	 * Clean up interactive elements from a message (remove buttons, etc.).
 	 * Optional — only needed if the platform can't auto-expire interactions.
 	 */
-	cleanupInteractive?(channelId: string, messageId: string): Promise<void>;
+	cleanupInteractive?(channelId: string, messageId: string, outcome?: InteractiveOutcome): Promise<void>;
 }
 
 /**
@@ -155,6 +175,7 @@ export abstract class BaseAdapter implements PlatformAdapter {
 	async cleanupInteractive(
 		_channelId: string,
 		_messageId: string,
+		_outcome?: InteractiveOutcome,
 	): Promise<void> {
 		// Default: nothing to clean up
 	}
@@ -164,7 +185,8 @@ export abstract class BaseAdapter implements PlatformAdapter {
 		channelId: string,
 		messageId: string,
 		content: string,
-	): Promise<void>;
+		options?: MessageEditOptions,
+	): Promise<void | MessageDelivery>;
 	abstract deleteMessage(channelId: string, messageId: string): Promise<void>;
 	abstract setTyping(channelId: string, isTyping: boolean): Promise<void>;
 	abstract getStatus(): Promise<{ connected: boolean; latency?: number }>;

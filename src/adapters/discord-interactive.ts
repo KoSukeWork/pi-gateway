@@ -60,15 +60,36 @@ export function truncateDiscordContent(
 ): string {
 	if (text.length <= max) return text;
 	const marker = "\n…(truncated)";
-	if (max <= marker.length) return text.slice(0, max);
-	return text.slice(0, max - marker.length) + marker;
+	if (max <= marker.length) return safeSlice(text, max);
+	return safeSlice(text, max - marker.length) + marker;
+}
+
+function safeSlice(text: string, end: number): string {
+	const previous = text.charCodeAt(end - 1);
+	const next = text.charCodeAt(end);
+	return text.slice(0, previous >= 0xd800 && previous <= 0xdbff && next >= 0xdc00 && next <= 0xdfff ? end - 1 : end);
+}
+
+function openCodeFence(text: string, current: string | null = null): string | null {
+	for (const match of text.matchAll(/^ {0,3}(```|~~~)([^\n]*)$/gm)) {
+		if (!current) current = match[1] + match[2].trim().slice(0, 60);
+		else if (match[1] === current.slice(0, 3) && !match[2].trim()) current = null;
+	}
+	return current;
+}
+
+/** Keep live status text outside an unfinished code block. */
+export function truncateDiscordMarkdown(text: string, max = DISCORD_CONTENT_MAX): string {
+	const preview = truncateDiscordContent(text, Math.max(1, max - 4));
+	const fence = openCodeFence(preview);
+	return fence ? `${preview}\n${fence.slice(0, 3)}` : preview;
 }
 
 /**
  * Split a Discord message into <=max chunks, preferring newline then space.
  * Empty / whitespace-only input yields no chunks (Discord rejects "").
  */
-export function splitDiscordContent(
+function splitPlainContent(
 	text: string,
 	max = DISCORD_CONTENT_MAX,
 ): string[] {
@@ -91,12 +112,27 @@ export function splitDiscordContent(
 			cut = max;
 			skipDelimiter = false;
 		}
-		const chunk = rest.slice(0, cut).trimEnd();
+		cut = safeSlice(rest, cut).length;
+		if (cut === 0) cut = Math.min(2, rest.length);
+		if (skipDelimiter) cut += 1;
+		const chunk = rest.slice(0, cut);
 		if (chunk) chunks.push(chunk);
-		rest = rest.slice(cut + (skipDelimiter ? 1 : 0));
+		rest = rest.slice(cut);
 	}
 	if (rest) chunks.push(rest);
 	return chunks;
+}
+
+/** Close/reopen fenced code across final messages, preserving its language. */
+export function splitDiscordContent(text: string, max = DISCORD_CONTENT_MAX): string[] {
+	const normalized = text.replace(/\r\n/g, "\n");
+	if (max < 100 || !/^ {0,3}(```|~~~)/m.test(normalized) || normalized.length <= max) return splitPlainContent(normalized, max);
+	let fence: string | null = null;
+	return splitPlainContent(normalized, max - 70).map((chunk) => {
+		const prefix = fence ? `${fence}\n` : "";
+		fence = openCodeFence(chunk, fence);
+		return `${prefix}${chunk}${fence ? `\n${fence.slice(0, 3)}` : ""}`;
+	});
 }
 
 /** Discord 429 `retry_after` is seconds. Returns null when the status is not 429. */
@@ -121,8 +157,8 @@ export function truncateDiscordLabel(
 	max = DISCORD_BUTTON_LABEL_MAX,
 ): string {
 	if (label.length <= max) return label;
-	if (max <= 1) return label.slice(0, max);
-	return `${label.slice(0, max - 1)}…`;
+	if (max <= 1) return safeSlice(label, max);
+	return `${safeSlice(label, max - 1)}…`;
 }
 
 export function discordButtonCustomId(
@@ -290,7 +326,7 @@ export function buildDiscordInteractiveMessage(
 		}
 		case "input":
 		case "editor":
-			return { content: truncateDiscordContent(inputContent(prompt)), components: [] };
+			return { content: truncateDiscordContent(inputContent(prompt)), components: prompt.requestId.length <= 90 ? [{ type: 1, components: [{ type: 2, style: BUTTON_PRIMARY, label: "填写回答", custom_id: `ui:i:${prompt.requestId}` }] }] : [] };
 		case "notify":
 		case "setStatus":
 		case "setWidget":
@@ -305,4 +341,21 @@ export function buildDiscordInteractiveMessage(
 				components: [],
 			};
 	}
+}
+
+export function buildDiscordInputModal(prompt: InteractivePrompt): Record<string, unknown> {
+	return {
+		custom_id: `ui:input:${prompt.requestId}`,
+		title: truncateDiscordLabel(prompt.title || "填写回答", 45),
+		components: [{ type: 1, components: [{
+			type: 4,
+			custom_id: "answer",
+			label: prompt.method === "editor" ? "编辑内容" : "你的回答",
+			style: 2,
+			required: false,
+			max_length: 4000,
+			...(prompt.placeholder ? { placeholder: truncateDiscordLabel(prompt.placeholder, 100) } : {}),
+			...(prompt.prefill ? { value: prompt.prefill.slice(0, 4000) } : {}),
+		}] }],
+	};
 }

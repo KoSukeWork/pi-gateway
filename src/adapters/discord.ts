@@ -14,7 +14,12 @@ import {
   type InteractivePrompt,
   type PlatformConfig,
   type PlatformMessage,
+  type MessageEditOptions,
+  type MessageDelivery,
+  type InteractiveOutcome,
 } from "./base.js";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { interactiveResponseStatus } from "../interactive.js";
 import { logger } from "../logger.js";
 import { DISCORD_SLASH_COMMANDS, slashInteractionToContent } from "./slash-commands.js";
 import {
@@ -24,6 +29,7 @@ import {
   splitDiscordContent,
   truncateDiscordContent,
   truncateDiscordLabel,
+  buildDiscordInputModal,
 } from "./discord-interactive.js";
 import {
   buildDiscordHeartbeat,
@@ -57,6 +63,7 @@ export interface DiscordConfig extends PlatformConfig {
   allowedChannels?: string[];  // Whitelist specific channels
   allowedRoles?: string[];     // Whitelist roles
   requireMention?: boolean;    // Require @mention in guilds
+  reactions?: boolean;
 }
 
 /** Drop bot/self messages so the bot cannot allowlist-loop on its own replies. */
@@ -87,6 +94,12 @@ export class DiscordAdapter extends BaseAdapter {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private reconnectAttempt = 0;
   private lastCloseCode: number | null = null;
+  private slashContext = new AsyncLocalStorage<{ channelId: string; token: string; applicationId: string; responded: boolean }>();
+  private interactiveMessages = new Map<string, { prompt: InteractivePrompt; content: string }>();
+  private previews = new Map<string, string>();
+  private overflowMessages = new Map<string, string[]>();
+  private activeReplies = new Map<string, string>();
+  private resumePickers = new Map<string, { owner: string; expiresAt: number }>();
 
   constructor(config: DiscordConfig) {
     super();
@@ -110,9 +123,10 @@ export class DiscordAdapter extends BaseAdapter {
     const url = `https://discord.com/api/v10${endpoint}`;
     return fetch(url, {
       ...options,
+      signal: options.signal ?? AbortSignal.timeout(15_000),
       headers: {
         "Authorization": `Bot ${this.config.botToken}`,
-        "Content-Type": "application/json",
+        ...(options.body instanceof FormData ? {} : { "Content-Type": "application/json" }),
         ...options.headers,
       },
     });
@@ -139,8 +153,12 @@ export class DiscordAdapter extends BaseAdapter {
     };
 
     this.wsConnection.onmessage = async (event) => {
-      const data: any = JSON.parse(event.data);
-      await this.handleGatewayMessage(data);
+      try {
+        const data: any = JSON.parse(event.data);
+        await this.handleGatewayMessage(data);
+      } catch (error) {
+        logger.error("[Discord] Gateway event failed:", error);
+      }
     };
 
     this.wsConnection.onerror = (err) => {
@@ -386,24 +404,33 @@ export class DiscordAdapter extends BaseAdapter {
       if (!this.config.allowedChannels.includes(data.channel_id)) return;
     }
 
-    // Check mention requirement in guilds
+    const rawContent = typeof data.content === "string" ? data.content : "";
+    const botId = this.getBotId();
+    const escapedBotId = botId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const mention = new RegExp(`<@!?${escapedBotId}>`, "g");
+    const mentioned = mention.test(rawContent);
+    mention.lastIndex = 0;
+    const replyingToBot = data.referenced_message?.author?.id === botId;
+    // Replies to the bot are also a direct conversation, including permission answers.
     if (!isDM && this.config.requireMention) {
-      const mentioned = data.content.includes(`<@${this.getBotId()}>`);
-      if (!mentioned) return;
+      if (!mentioned && !replyingToBot) return;
     }
+    const content = rawContent.replace(mention, "").trim();
+    if (!content) return;
 
     const message: PlatformMessage = {
       id: data.id,
       platform: this.platform,
       channelId: data.channel_id,
       userId: data.author.id,
-      content: data.content,
+      content,
       timestamp: new Date(data.timestamp).getTime(),
       metadata: {
         guildId: data.guild_id,
         username: data.author.username,
         discriminator: data.author.discriminator,
         isDM,
+        replyToMessageId: data.message_reference?.message_id,
       },
     };
 
@@ -420,6 +447,10 @@ export class DiscordAdapter extends BaseAdapter {
   }
 
   private async handleInteraction(data: any): Promise<void> {
+    if (data.type === 5) {
+      await this.handleModalInteraction(data);
+      return;
+    }
     // 3 = MESSAGE_COMPONENT (button / select menu)
     if (data.type === 3) {
       await this.handleComponentInteraction(data);
@@ -435,10 +466,7 @@ export class DiscordAdapter extends BaseAdapter {
     if (!userId || !channelId) return;
 
     try {
-      await this.apiRequest(`/interactions/${data.id}/${data.token}/callback`, {
-        method: "POST",
-        body: JSON.stringify({ type: 5 }),
-      });
+      await this.ackInteraction(data, { type: 5 });
     } catch (error) {
       logger.error("[Discord] Failed to acknowledge slash command:", error);
       return;
@@ -458,21 +486,26 @@ export class DiscordAdapter extends BaseAdapter {
         slashCommand: true,
       },
     };
-    await this.callbacks?.onMessage(message);
+    const context = { channelId, token: data.token, applicationId: data.application_id ?? this.applicationId ?? this.getBotId(), responded: false };
+    await this.slashContext.run(context, async () => {
+      try {
+        await this.callbacks?.onMessage(message);
+        if (!context.responded) await this.sendDiscordMessage(channelId, { content: "✅ 指令已处理。" });
+      } catch (error) {
+        logger.error("[Discord] Slash command failed:", error);
+        if (!context.responded) await this.sendDiscordMessage(channelId, { content: "❌ 指令执行失败，请稍后重试。" });
+      }
+    });
   }
 
   private async ackInteraction(
     data: any,
     payload: { type: number; data?: Record<string, unknown> },
   ): Promise<void> {
-    try {
-      await this.apiRequest(`/interactions/${data.id}/${data.token}/callback`, {
+    await this.requestDiscordWithRetry(`/interactions/${data.id}/${data.token}/callback`, {
         method: "POST",
-        body: JSON.stringify(payload),
-      });
-    } catch (error) {
-      logger.error("[Discord] Failed to acknowledge interaction:", error);
-    }
+        body: JSON.stringify({ ...payload, ...([4, 7].includes(payload.type) && payload.data ? { data: { ...payload.data, allowed_mentions: { parse: [], replied_user: false } } } : {}) }),
+      }, "acknowledge interaction");
   }
 
   private async handleModelPickerInteraction(data: any): Promise<boolean> {
@@ -623,7 +656,7 @@ export class DiscordAdapter extends BaseAdapter {
       logger.warn(`[Discord] Unknown interactive custom_id: ${customId}`);
       return;
     }
-    await this.emitMessage({
+    const message: PlatformMessage = {
       id: data.id ?? customId,
       platform: this.platform,
       channelId,
@@ -634,8 +667,11 @@ export class DiscordAdapter extends BaseAdapter {
         guildId: data.guild_id,
         isDM: !data.guild_id,
         callback: true,
+        callbackMessageId: data.message?.id,
       },
-    });
+    };
+    // A picker selection replaces its own "Switching…" response with the result.
+    await this.slashContext.run({ channelId, token: data.token, applicationId: data.application_id ?? this.applicationId ?? this.getBotId(), responded: false }, () => this.emitMessage(message));
   }
 
   private async handleComponentInteraction(data: any): Promise<void> {
@@ -644,14 +680,79 @@ export class DiscordAdapter extends BaseAdapter {
     const customId: string = data.data?.custom_id ?? "";
     const parsed = parseDiscordButtonCustomId(customId);
     const userId = data.member?.user?.id ?? data.user?.id;
-
-    await this.ackInteraction(data, { type: 7, data: { components: [] } });
-
-    if (parsed) {
+    if (/^resume:\d+$/.test(customId)) {
+      const key = `${data.channel_id}:${data.message?.id}`;
+      const picker = this.resumePickers.get(key);
+      if (!picker || picker.expiresAt <= Date.now() || picker.owner !== userId) {
+        await this.ackInteraction(data, { type: 4, data: { content: picker && picker.expiresAt > Date.now() ? "这个会话列表属于其他用户，请用 /resume 打开自己的列表。" : "会话列表已失效，请重新使用 /resume。", flags: 64 } });
+        return;
+      }
+      this.resumePickers.delete(key);
+      await this.ackInteraction(data, { type: 7, data: { content: "⏳ 正在打开所选会话…", components: [] } });
+      await this.emitCallback(data, customId);
+      return;
+    }
+    if (customId === "turn:stop") {
+      const owner = this.activeReplies.get(`${data.channel_id}:${data.message?.id}`);
+      if (!owner || owner !== userId) {
+        await this.ackInteraction(data, { type: 4, data: { content: owner ? "只有任务发起者可以使用这个停止按钮。" : "这个任务已经结束。", flags: 64 } });
+        return;
+      }
+      await this.ackInteraction(data, { type: 4, data: { content: "🛑 正在请求停止…", flags: 64 } });
+      await this.emitMessage({ id: data.id, platform: this.platform, channelId: data.channel_id, userId,
+        content: "/stop", timestamp: Date.now(), metadata: { callback: true, stopButton: true } });
+      return;
+    }
+    const inputId = customId.startsWith("ui:i:") ? customId.slice(5) : null;
+    if (parsed || inputId) {
+      const requestId = parsed?.requestId ?? inputId!;
+      const status = interactiveResponseStatus(requestId, this.platform, data.channel_id, userId, data.message?.id);
+      if (status !== "valid") {
+        await this.ackInteraction(data, { type: 4, data: {
+          content: status === "forbidden" ? "只有发起任务的用户可以回答这个提问。" : "这个提问已结束或超时，请重新触发。",
+          flags: 64,
+        } });
+        return;
+      }
+      if (inputId) {
+        const saved = this.interactiveMessages.get(`${data.channel_id}:${data.message?.id}`);
+        if ((saved?.prompt.prefill?.length ?? 0) > 4000) {
+          await this.ackInteraction(data, { type: 4, data: { content: "原始内容超过 Discord 表单的 4000 字符限制，不能在表单中完整编辑。请查看完整提问附件，并用聊天消息回答。", flags: 64 } });
+          return;
+        }
+        if (!saved) {
+          await this.ackInteraction(data, { type: 4, data: { content: "提问已失效，请重新触发。", flags: 64 } });
+          return;
+        }
+        await this.ackInteraction(data, { type: 9, data: buildDiscordInputModal(saved.prompt) });
+        return;
+      }
+      // Defer the component update. The bridge records the answer and clears it.
+      await this.ackInteraction(data, { type: 6 });
       this.callbacks?.onInteractiveResponse?.(parsed, userId);
       return;
     }
+    await this.ackInteraction(data, { type: 7, data: { components: [] } });
     await this.emitCallback(data, customId);
+  }
+
+  private async handleModalInteraction(data: any): Promise<void> {
+    const customId = String(data.data?.custom_id ?? "");
+    if (!customId.startsWith("ui:input:")) return;
+    const requestId = customId.slice(9);
+    const userId = data.member?.user?.id ?? data.user?.id;
+    const status = interactiveResponseStatus(requestId, this.platform, data.channel_id, userId, data.message?.id);
+    if (status !== "valid") {
+      await this.ackInteraction(data, { type: 4, data: { content: status === "forbidden" ? "只有发起任务的用户可以回答。" : "提问已结束或超时，回答未提交。", flags: 64 } });
+      return;
+    }
+    const field = data.data?.components?.flatMap((row: any) => row.components ?? []).find((component: any) => component.custom_id === "answer");
+    if (typeof field?.value !== "string" || field.value.length > 4000) {
+      await this.ackInteraction(data, { type: 4, data: { content: "没有收到有效回答，请重试。", flags: 64 } });
+      return;
+    }
+    const accepted = this.callbacks?.onInteractiveResponse?.({ requestId, value: field.value }, userId);
+    await this.ackInteraction(data, { type: 4, data: { content: accepted === false ? "提问已结束，回答未提交。" : "✅ 回答已提交。", flags: 64 } });
   }
 
   async sendInteractive(
@@ -659,23 +760,37 @@ export class DiscordAdapter extends BaseAdapter {
     prompt: InteractivePrompt,
   ): Promise<{ messageId: string }> {
     const payload = buildDiscordInteractiveMessage(prompt);
+    const details = [prompt.title, prompt.message, ...(prompt.options ?? []).map((option, index) => `${index + 1}. ${option}`), prompt.prefill].filter(Boolean).join("\n\n");
+    if (details.length > 1700) {
+      await this.sendTextAttachment(channelId, details, "完整提问和选项见附件；下方消息用于回答。", "prompt.txt");
+    }
     if (!payload.content && payload.components.length === 0) {
       return { messageId: "0" };
     }
     const messageId = await this.sendDiscordMessage(channelId, payload);
+    if (["select", "confirm", "input", "editor"].includes(prompt.method)) {
+      this.interactiveMessages.set(`${channelId}:${messageId}`, { prompt, content: payload.content });
+    }
     return { messageId };
   }
 
   override async cleanupInteractive(
     channelId: string,
     messageId: string,
+    outcome?: InteractiveOutcome,
   ): Promise<void> {
     if (!messageId || messageId === "0") return;
+    const key = `${channelId}:${messageId}`;
+    const saved = this.interactiveMessages.get(key);
+    this.interactiveMessages.delete(key);
+    const note = outcome?.status === "answered"
+      ? `✅ ${outcome.label ? `已选择：${outcome.label}` : "回答已提交。"}`
+      : outcome?.status === "expired" ? "⌛ 提问已超时。" : "🛑 提问已取消。";
     try {
-      await this.apiRequest(`/channels/${channelId}/messages/${messageId}`, {
+      await this.requestDiscordWithRetry(`/channels/${channelId}/messages/${messageId}`, {
         method: "PATCH",
-        body: JSON.stringify({ components: [] }),
-      });
+        body: JSON.stringify({ components: [], ...(saved ? { content: `${truncateDiscordContent(saved.content, 1700)}\n\n${note.slice(0, 250)}` } : {}), allowed_mentions: { parse: [], replied_user: false } }),
+      }, "clear interactive components");
     } catch (error) {
       logger.warn("[Discord] Failed to clear interactive components:", error);
     }
@@ -691,15 +806,47 @@ export class DiscordAdapter extends BaseAdapter {
       if (lastId) {
         await new Promise((resolve) => setTimeout(resolve, 350));
       }
-      lastId = await this.sendDiscordMessage(channelId, { content: chunk });
+      try {
+        lastId = await this.sendDiscordMessage(channelId, { content: chunk });
+      } catch (error) {
+        logger.warn("[Discord] Text delivery failed; trying complete attachment:", error);
+        return await this.sendTextAttachment(channelId, content, "⚠️ 文本发送失败，完整内容见附件。请以附件为准。");
+      }
     }
     return lastId;
+  }
+
+  private async sendTextAttachment(channelId: string, content: string, note: string, filename = "response.txt"): Promise<string> {
+    const body = new FormData();
+    body.append("payload_json", JSON.stringify({ content: note, allowed_mentions: { parse: [], replied_user: false }, attachments: [{ id: 0, filename }] }));
+    body.append("files[0]", new Blob([content], { type: "text/plain;charset=utf-8" }), filename);
+    const response = await this.requestDiscordWithRetry(`/channels/${channelId}/messages`, { method: "POST", body }, "send complete text attachment");
+    return ((await response.json()) as { id: string }).id;
+  }
+
+  async sendReply(message: PlatformMessage, content: string): Promise<string> {
+    const messageId = await this.sendDiscordMessage(message.channelId, {
+      content: truncateDiscordContent(content),
+      components: [{ type: 1, components: [{ type: 2, style: 2, label: "停止任务", custom_id: "turn:stop" }] }],
+      ...(!message.metadata?.slashCommand && !message.metadata?.callback ? {
+        message_reference: { message_id: message.id, fail_if_not_exists: false },
+      } : {}),
+    });
+    this.activeReplies.set(`${message.channelId}:${messageId}`, message.userId);
+    return messageId;
+  }
+
+  async setMessageReaction(channelId: string, messageId: string, emoji: string, enabled: boolean): Promise<void> {
+    if (this.config.reactions === false) return;
+    await this.requestDiscordWithRetry(`/channels/${channelId}/messages/${messageId}/reactions/${encodeURIComponent(emoji)}/@me`,
+      { method: enabled ? "PUT" : "DELETE" }, "update reaction");
   }
 
   async sendButtons(
     channelId: string,
     text: string,
     buttons: Array<Array<{ text: string; data: string }>>,
+    ownerUserId?: string,
   ): Promise<string> {
     const components = buttons.slice(0, 5).map((row) => ({
       type: 1 as const,
@@ -710,10 +857,15 @@ export class DiscordAdapter extends BaseAdapter {
         custom_id: button.data.slice(0, 100),
       })),
     }));
-    return this.sendDiscordMessage(channelId, {
+    const messageId = await this.sendDiscordMessage(channelId, {
       content: truncateDiscordContent(text),
       components,
     });
+    if (ownerUserId && buttons.some((row) => row.some((button) => button.data.startsWith("resume:")))) {
+      this.resumePickers.set(`${channelId}:${messageId}`, { owner: ownerUserId, expiresAt: Date.now() + 5 * 60_000 });
+      if (this.resumePickers.size > 256) this.resumePickers.delete(this.resumePickers.keys().next().value!);
+    }
+    return messageId;
   }
 
   async sendModelPicker(
@@ -729,16 +881,25 @@ export class DiscordAdapter extends BaseAdapter {
 
   private async sendDiscordMessage(
     channelId: string,
-    body: { content: string; components?: ReturnType<typeof buildDiscordInteractiveMessage>["components"] },
+    body: { content: string; components?: ReturnType<typeof buildDiscordInteractiveMessage>["components"]; message_reference?: { message_id: string; fail_if_not_exists: boolean } },
   ): Promise<string> {
-    const response = await this.requestDiscordWithRetry(
-      `/channels/${channelId}/messages`,
-      {
-        method: "POST",
-        body: JSON.stringify(body),
-      },
-      "send message",
-    );
+    const context = this.slashContext.getStore();
+    const useOriginal = context?.channelId === channelId && !context.responded;
+    if (useOriginal) context.responded = true;
+    let response: Response;
+    try {
+      response = await this.requestDiscordWithRetry(
+        useOriginal ? `/webhooks/${context.applicationId}/${context.token}/messages/@original` : `/channels/${channelId}/messages`,
+        {
+          method: useOriginal ? "PATCH" : "POST",
+          body: JSON.stringify({ ...body, allowed_mentions: { parse: [], replied_user: false } }),
+        },
+        "send message",
+      );
+    } catch (error) {
+      if (useOriginal) context.responded = false;
+      throw error;
+    }
     const data = (await response.json()) as { id: string };
     return data.id;
   }
@@ -761,43 +922,78 @@ export class DiscordAdapter extends BaseAdapter {
         await new Promise((resolve) => setTimeout(resolve, waitMs));
         continue;
       }
+      if (response.status >= 500 && ["PATCH", "PUT", "DELETE"].includes(String(options.method)) && attempt < maxAttempts) {
+        await new Promise((resolve) => setTimeout(resolve, 250 * attempt));
+        continue;
+      }
       throw new Error(`Failed to ${action}: ${error}`);
     }
     throw new Error(`Failed to ${action}: exhausted Discord retries`);
   }
 
-  async editMessage(channelId: string, messageId: string, content: string): Promise<void> {
-    const chunks = splitDiscordContent(content);
+  async editMessage(channelId: string, messageId: string, content: string, options?: MessageEditOptions): Promise<void | MessageDelivery> {
+    const key = `${channelId}:${messageId}`;
+    const preview = options?.finalize === false;
+    const chunks = preview ? [truncateDiscordContent(content)] : splitDiscordContent(content);
     if (chunks.length === 0) {
       return;
     }
+    if (preview && this.previews.get(key) === chunks[0]) return;
     await this.requestDiscordWithRetry(
       `/channels/${channelId}/messages/${messageId}`,
       {
         method: "PATCH",
-        body: JSON.stringify({ content: chunks[0] }),
+        body: JSON.stringify({ content: chunks[0], ...(!preview && this.activeReplies.has(key) ? { components: [] } : {}), allowed_mentions: { parse: [], replied_user: false } }),
       },
       "edit message",
     );
-    for (const extra of chunks.slice(1)) {
+    if (preview) {
+      this.previews.set(key, chunks[0]);
+      if (this.previews.size > 256) this.previews.delete(this.previews.keys().next().value!);
+      return;
+    }
+    this.previews.delete(key);
+    this.activeReplies.delete(key);
+    const overflow = this.overflowMessages.get(key) ?? [];
+    this.overflowMessages.set(key, overflow);
+    if (this.overflowMessages.size > 256) this.overflowMessages.delete(this.overflowMessages.keys().next().value!);
+    for (let index = 1; index < chunks.length; index++) {
       try {
-        await this.sendDiscordMessage(channelId, { content: extra });
+        if (overflow[index - 1]) {
+          await this.requestDiscordWithRetry(`/channels/${channelId}/messages/${overflow[index - 1]}`, {
+            method: "PATCH", body: JSON.stringify({ content: chunks[index], allowed_mentions: { parse: [], replied_user: false } }),
+          }, "edit continuation");
+        } else {
+          overflow.push(await this.sendDiscordMessage(channelId, { content: chunks[index],
+            message_reference: { message_id: overflow.at(-1) ?? messageId, fail_if_not_exists: false } }));
+        }
       } catch (error) {
+        try {
+          await this.sendTextAttachment(channelId, content, "⚠️ 分段发送失败，完整回复见附件。前面已发送的段落保留。请以附件为准。");
+          return { partial: false, deliveredChunks: chunks.length, totalChunks: chunks.length };
+        } catch (attachmentError) {
+          logger.error("[Discord] Complete response attachment also failed:", attachmentError);
+        }
         // The first chunk is already visible. Throwing here makes the caller
         // resend the entire response and duplicate all delivered chunks.
         logger.error(
           "[Discord] Response was only partially delivered; not resending the prefix:",
           error,
         );
-        return;
+        return { partial: true, deliveredChunks: index, totalChunks: chunks.length };
       }
     }
+    for (const obsolete of overflow.splice(chunks.length - 1)) await this.deleteMessage(channelId, obsolete);
+    return { partial: false, deliveredChunks: chunks.length, totalChunks: chunks.length };
   }
 
   async deleteMessage(channelId: string, messageId: string): Promise<void> {
     await this.apiRequest(`/channels/${channelId}/messages/${messageId}`, {
       method: "DELETE",
     });
+    this.activeReplies.delete(`${channelId}:${messageId}`);
+    this.previews.delete(`${channelId}:${messageId}`);
+    this.overflowMessages.delete(`${channelId}:${messageId}`);
   }
 
   async setTyping(channelId: string, isTyping: boolean): Promise<void> {
@@ -819,6 +1015,11 @@ export class DiscordAdapter extends BaseAdapter {
     await super.stop();
     this.clearReconnectTimer();
     this.teardownSocket();
+    this.interactiveMessages.clear();
+    this.previews.clear();
+    this.overflowMessages.clear();
+    this.activeReplies.clear();
+    this.resumePickers.clear();
   }
 
   // Helper to register slash commands

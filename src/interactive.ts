@@ -14,7 +14,7 @@
  * long enough, or the agent ends.
  */
 
-import type { BaseAdapter } from "./adapters/base.js";
+import type { BaseAdapter, InteractiveOutcome } from "./adapters/base.js";
 import { logger } from "./logger.js";
 
 // ── Types ───────────────────────────────────────────────────────────────────
@@ -95,6 +95,7 @@ interface PendingUiRequest {
 	method: DialogUiMethod;
 	options?: string[];
 	timeoutHandle?: ReturnType<typeof setTimeout>;
+	outcome?: InteractiveOutcome;
 }
 
 const pendingUiRequests = new Map<string, PendingUiRequest>();
@@ -137,6 +138,20 @@ export function pendingUiCount(): number {
 	return pendingUiRequests.size;
 }
 
+/** Validate before an adapter acknowledges a button or opens an input modal. */
+export function interactiveResponseStatus(
+	requestId: string,
+	platform: string,
+	channelId: string,
+	userId?: string,
+	messageId?: string,
+): "valid" | "forbidden" | "expired" {
+	const pending = pendingUiRequests.get(requestId);
+	if (!pending || pending.platform !== platform || pending.channelId !== channelId || (messageId && pending.messageId !== messageId)) return "expired";
+	if (pending.userId && pending.userId !== userId) return "forbidden";
+	return "valid";
+}
+
 /** Test helper — drop pending state without talking to Pi. */
 export function resetInteractiveStateForTests(): void {
 	for (const pending of pendingUiRequests.values()) {
@@ -153,16 +168,18 @@ export function resetInteractiveStateForTests(): void {
  * Tell Pi this dialog was cancelled so a tool_call cannot hang.
  * Safe to call if the id is unknown — Pi ignores unmatched responses.
  */
-export function cancelUiRequest(requestId: string): void {
+export function cancelUiRequest(requestId: string, reason: "cancelled" | "expired" = "cancelled"): void {
 	const pending = pendingUiRequests.get(requestId);
 	if (pending?.timeoutHandle) clearTimeout(pending.timeoutHandle);
 	if (pending) {
+		pending.outcome = { status: reason };
 		pendingUiRequests.delete(requestId);
 		pending.adapter
-			.cleanupInteractive?.(pending.channelId, pending.messageId)
+			.cleanupInteractive?.(pending.channelId, pending.messageId, { status: reason })
 			.catch(() => {});
 	}
 	sendUiResponse(requestId, { requestId, cancelled: true });
+	if (pending) streamRedirectHandler?.();
 }
 
 /**
@@ -180,6 +197,7 @@ export async function handleExtensionUiRequest(
 		}
 		return;
 	}
+	const channel = activeChannel;
 
 	const prompt: InteractivePrompt = {
 		requestId: msg.id,
@@ -202,54 +220,40 @@ export async function handleExtensionUiRequest(
 	]);
 	if (fireAndForget.has(msg.method)) {
 		try {
-			await adapter.sendInteractive(activeChannel.channelId, prompt);
+			await adapter.sendInteractive(channel.channelId, prompt);
 		} catch (err) {
 			logger.error(`[interactive] Failed to send ${msg.method}:`, err);
 		}
 		return;
 	}
 
-	// Dialog method — send and track for response
+	// Track before the REST await: stop/timeout must cancel even an in-flight send.
+	const pending: PendingUiRequest = {
+		requestId: msg.id, platform: channel.platform, channelId: channel.channelId,
+		userId: channel.userId, messageId: "", adapter,
+		method: msg.method as DialogUiMethod, options: msg.options,
+	};
+	const timeoutMs = msg.timeout && msg.timeout > 0 ? msg.timeout : DEFAULT_INTERACTIVE_TIMEOUT_MS;
+	pending.timeoutHandle = setTimeout(() => {
+		if (pendingUiRequests.get(msg.id) === pending) cancelUiRequest(msg.id, "expired");
+	}, timeoutMs);
+	pendingUiRequests.set(msg.id, pending);
 	try {
-		const result = await adapter.sendInteractive(
-			activeChannel.channelId,
-			prompt,
-		);
-		if (!result?.messageId) {
-			logger.error(
-				`[interactive] sendInteractive returned no messageId for ${msg.method} — auto-cancelling`,
-			);
-			cancelUiRequest(msg.id);
+		const result = await adapter.sendInteractive(channel.channelId, prompt);
+		if (!result?.messageId || result.messageId === "0") {
+			if (pendingUiRequests.get(msg.id) === pending) cancelUiRequest(msg.id);
 			return;
 		}
-		const timeoutMs =
-			msg.timeout && msg.timeout > 0
-				? msg.timeout
-				: DEFAULT_INTERACTIVE_TIMEOUT_MS;
-		const timeoutHandle = setTimeout(() => {
-			if (!pendingUiRequests.has(msg.id)) return;
-			logger.warn(
-				`[interactive] Timed out waiting for ${msg.method} ${msg.id.slice(0, 8)}… after ${timeoutMs}ms`,
-			);
-			cancelUiRequest(msg.id);
-		}, timeoutMs);
-		pendingUiRequests.set(msg.id, {
-			requestId: msg.id,
-			platform: activeChannel.platform,
-			channelId: activeChannel.channelId,
-			userId: activeChannel.userId,
-			messageId: result.messageId,
-			adapter,
-			method: msg.method as DialogUiMethod,
-			options: msg.options,
-			timeoutHandle,
-		});
-		logger.info(
-			`[interactive] Sent ${msg.method} prompt ${msg.id.slice(0, 8)}… to ${activeChannel.platform}/${activeChannel.channelId}`,
-		);
-	} catch (err) {
-		logger.error("[interactive] Failed to send interactive prompt:", err);
-		cancelUiRequest(msg.id);
+		pending.messageId = result.messageId;
+		if (pendingUiRequests.get(msg.id) !== pending || activeChannel !== channel) {
+			await adapter.cleanupInteractive?.(channel.channelId, result.messageId, pending.outcome ?? { status: "cancelled" });
+			if (pendingUiRequests.get(msg.id) === pending) cancelUiRequest(msg.id);
+			return;
+		}
+		logger.info(`[interactive] Sent ${msg.method} prompt to ${channel.platform}/${channel.channelId}`);
+	} catch (error) {
+		logger.error("[interactive] Failed to send interactive prompt:", error);
+		if (pendingUiRequests.get(msg.id) === pending) cancelUiRequest(msg.id);
 	}
 }
 
@@ -345,14 +349,14 @@ export function tryConsumeTextReply(
 export function handleInteractiveResponse(
 	response: InteractiveResponse,
 	fromUserId?: string,
-): void {
+): boolean {
 	let pending = response.requestId
 		? pendingUiRequests.get(response.requestId)
 		: undefined;
 
 	// Fallback for ForceReply: if no requestId, find the most recent
 	// pending request for the current active channel.
-	if (!pending && activeChannel) {
+	if (!pending && !response.requestId && activeChannel) {
 		pending = latestPendingForChannel(
 			activeChannel.platform,
 			activeChannel.channelId,
@@ -364,14 +368,14 @@ export function handleInteractiveResponse(
 		logger.warn(
 			`[interactive] No pending request for id ${(response.requestId || "(empty)").slice(0, 8)}…`,
 		);
-		return;
+		return false;
 	}
 
 	if (pending.userId && fromUserId && pending.userId !== fromUserId) {
 		logger.warn(
 			`[interactive] Ignoring response for ${pending.requestId.slice(0, 8)}… from other user ${fromUserId}`,
 		);
-		return;
+		return false;
 	}
 
 	logger.info(
@@ -389,23 +393,23 @@ export function handleInteractiveResponse(
 			idx < pending.options.length
 		) {
 			response.value = pending.options[idx];
-		}
+		} else if (!pending.options.includes(response.value)) return false;
 	}
 
 	if (pending.timeoutHandle) clearTimeout(pending.timeoutHandle);
 	pendingUiRequests.delete(response.requestId);
+	pending.outcome = {
+		status: response.cancelled ? "cancelled" : "answered",
+		label: pending.method === "select" ? response.value : pending.method === "confirm" ? (response.confirmed ? "Yes" : "No") : undefined,
+	};
 	pending.adapter
-		.cleanupInteractive?.(pending.channelId, pending.messageId)
+		.cleanupInteractive?.(pending.channelId, pending.messageId, pending.outcome)
 		.catch(() => {});
 	sendUiResponse(response.requestId, response);
 
 	// Redirect subsequent streaming to a new message after select/confirm
-	if (
-		streamRedirectHandler &&
-		(response.value !== undefined || response.confirmed !== undefined)
-	) {
-		streamRedirectHandler();
-	}
+	streamRedirectHandler?.();
+	return true;
 }
 
 /**

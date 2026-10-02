@@ -24,7 +24,10 @@
     "discord": {
       "enabled": false,
       "botToken": "",
-      "guildId": ""
+      "guildId": "",
+      "reactions": true,
+      "allowedChannels": [],
+      "requireMention": false
     },
     "twitch": {
       "enabled": false,

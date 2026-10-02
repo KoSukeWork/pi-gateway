@@ -58,7 +58,24 @@ let postCount = 0;
 await partial.editMessage("channel", "message", "x".repeat(4500));
 assert.deepEqual(
 	requests.map((request) => request.method),
-	["PATCH", "POST", "POST"],
+	["PATCH", "POST", "POST", "POST"],
 );
+
+// A failed continuation preserves the entire response in a UTF-8 attachment.
+{
+	const adapter = new DiscordAdapter({ platform: "discord", botToken: "test", enabled: true });
+	const original = "中文 😀\n".repeat(600);
+	let attached = "";
+	(adapter as any).apiRequest = async (_endpoint: string, options: RequestInit) => {
+		if (options.body instanceof FormData) {
+			attached = await (options.body.get("files[0]") as Blob).text();
+			return response(JSON.stringify({ id: "attachment" }));
+		}
+		return options.method === "PATCH" ? response("{}") : response("denied", 403);
+	};
+	const delivery = await adapter.editMessage("channel", "message", original);
+	assert.equal(delivery?.partial, false);
+	assert.equal(attached, original);
+}
 
 console.log("discord delivery tests passed");

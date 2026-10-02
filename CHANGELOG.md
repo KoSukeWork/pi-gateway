@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- Rebuild the chat reply lifecycle around one persistent reply, serialized/coalesced preview edits, task phases, elapsed time, and reliable final delivery. Dialogs resume the same reply instead of creating extra thinking placeholders.
+- Follow the Hermes Discord patterns of in-place streaming previews, final-only overflow delivery, and processing/completion reactions. Preserve fenced code and Unicode across final chunks, retain status in oversized previews, and report partial delivery to the user.
+- Complete deferred Discord slash responses and replace model/resume pickers with their outcome. Add `/help`, `/stop`, owner-bound Stop buttons, and native input/editor modals.
+- Bind permission buttons to their request, channel, message, and owner; record answered/cancelled/expired status. Cancel even prompts whose send is still in flight, and reject stale IDs without answering newer questions.
+- Reserve the shared RPC worker before asynchronous preparation. Only the initiating user/channel may steer; other chats and session changes receive an explicit busy response.
+- Back default channel conversations with distinct persistent Pi session files, restore their history when switching channels, and give `/new` a fresh history.
+
+### Fixed
+- Register prompt completions before sending RPC commands, so an ACK and terminal event in one stdout chunk cannot strand a thinking message. Propagate model errors and process exits, clear request timers, and settle active replies during shutdown.
+- Keep old RPC process exits from clearing a replacement worker's state. Close inline gateway resources when the host session shuts down.
+- Scope Discord resume choices to each displayed message instead of interpreting old indices against a newer list. Enforce picker ownership and expiry.
+- Handle guild nickname mentions and replies to the bot; suppress automatic mentions in generated messages and retry transient idempotent edits.
+
 ## [1.16.7] - 2026-09-07
 
 ### Fixed
