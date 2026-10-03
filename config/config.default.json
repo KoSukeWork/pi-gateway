@@ -27,6 +27,7 @@
       "guildId": "",
       "reactions": true,
       "allowedChannels": [],
+      "allowedRoles": [],
       "requireMention": false
     },
     "twitch": {

@@ -42,6 +42,21 @@ function fixture() {
 	assert.equal(f.requests.at(-1)!.payload.data.flags, 64);
 }
 
+// Role restrictions apply to text, slash commands, buttons and modal submissions.
+{
+	const f = fixture(); f.adapter.config.allowedRoles = ["allowed-role"];
+	let calls = 0;
+	(f.adapter as any).callbacks = { onMessage: async () => { calls++; }, onInteractiveResponse: () => { calls++; } };
+	const context = { id: "request", token: "token", guild_id: "g", channel_id: "c", member: { user: { id: "owner" }, roles: ["other-role"] } };
+	await (f.adapter as any).handleMessage({ ...context, author: { id: "owner" }, content: "hello" });
+	for (const type of [2, 3, 5]) await (f.adapter as any).handleInteraction({ ...context, type, data: { name: "help", custom_id: "ui:input:question" } });
+	assert.equal(calls, 0);
+	assert.equal(f.requests.length, 3);
+	assert.ok(f.requests.every((r) => r.payload.type === 4 && r.payload.data.flags === 64));
+	await (f.adapter as any).handleMessage({ ...context, member: { ...context.member, roles: ["allowed-role"] }, author: { id: "owner" }, content: "hello" });
+	assert.equal(calls, 1);
+}
+
 // A callback producing no reply must not leave its picker in "Switching" forever.
 {
 	const f = fixture();
@@ -202,6 +217,23 @@ assert.equal(discordRetryAfterMs(429, JSON.stringify({ retry_after: 31 })), 3105
 	f.response((r) => r.options.method === "PATCH" ? new Response("denied", { status: 403 }) : new Response(JSON.stringify({ id: "attachment" })));
 	await reply.finish("long complete answer ".repeat(1000));
 	assert.equal(f.requests.filter((r) => r.file !== undefined).length, 1);
+}
+
+// A replacement reply expires the original Stop button even when cleanup fails.
+{
+	const f = fixture(); const { ChatReply } = await import("../src/chat-reply.js");
+	const reply = new ChatReply(f.adapter, { platform: "discord", channelId: "c", userId: "owner", id: "input", content: "hi", timestamp: 1 });
+	await reply.start();
+	const originalId = `sent-${f.requests.findIndex((r) => r.payload.components?.[0]?.components?.[0]?.custom_id === "turn:stop") + 1}`;
+	f.response((r) => ["PATCH", "DELETE"].includes(String(r.options.method))
+		? new Response("denied", { status: 403 }) : new Response(JSON.stringify({ id: "replacement" })));
+	await reply.finish("complete answer");
+	let stopped = 0;
+	(f.adapter as any).callbacks = { onMessage: async () => { stopped++; } };
+	await (f.adapter as any).handleInteraction({ type: 3, id: "old-stop", token: "t", channel_id: "c", user: { id: "owner" }, message: { id: originalId }, data: { custom_id: "turn:stop" } });
+	assert.equal(stopped, 0, "a leftover Stop button must not control a new turn");
+	assert.equal(f.requests.at(-1)!.payload.data.flags, 64);
+	assert.match(f.requests.at(-1)!.payload.data.content, /任务已经结束/);
 }
 
 console.log("Discord Hermes review regressions passed");

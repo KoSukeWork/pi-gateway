@@ -48,6 +48,20 @@ function fakeAdapter() {
 	assert.ok(f.edits.at(-1)!.content.includes("x".repeat(500)));
 }
 
+// Extension failures shown by Pi's UI stay visible in the preview and full final reply.
+{
+	const f = fakeAdapter(); const reply = new ChatReply(f.adapter, message, 1);
+	await reply.start();
+	reply.event({ type: "extension_error", event: "input", error: "input extension failed" });
+	await pause();
+	assert.match(f.edits.at(-1)!.content, /扩展执行出错：input extension failed/);
+	const longError = "complete extension error ".repeat(200);
+	reply.event({ type: "extension_error", event: "tool_call", error: longError });
+	await reply.finish("completed answer");
+	assert.ok(f.edits.at(-1)!.content.includes("input extension failed"));
+	assert.ok(f.edits.at(-1)!.content.includes(longError));
+}
+
 // Permission context is fully delivered once, before the dialog is displayed.
 {
 	const f = fakeAdapter(); const reply = new ChatReply(f.adapter, message, 1);

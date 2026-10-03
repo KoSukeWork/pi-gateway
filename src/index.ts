@@ -34,6 +34,7 @@ import { randomBytes } from "node:crypto";
 import { spawn } from "node:child_process";
 import { isLoopbackHost, resolveDaemonInvocation, resolveRpcExtensionPath } from "./runtime-entry.js";
 import { buildRpcPiArgs, resolvePiInvocation } from "./resolve-pi.js";
+import { isGatewayRpcChild } from "./rpc-child.js";
 import { ChatReply } from "./chat-reply.js";
 import { agentEndError, agentEndText, AssistantStream } from "./agent-response.js";
 import { ownsChatTurn, CHAT_HELP } from "./chat-turn.js";
@@ -193,6 +194,7 @@ interface GatewayConfig {
 			botToken: string;
 			guildId?: string;
 			allowedChannels?: string[];
+			allowedRoles?: string[];
 			requireMention?: boolean;
 			reactions?: boolean;
 		};
@@ -300,7 +302,7 @@ interface PendingRequest {
 	id: string;
 	resolve: (msg: unknown) => void;
 	reject: (err: Error) => void;
-	timer: ReturnType<typeof setTimeout>;
+	timer?: ReturnType<typeof setTimeout>;
 }
 const pendingRequests: PendingRequest[] = [];
 
@@ -318,6 +320,9 @@ interface PendingCompletion {
 	onEvent?: (event: Record<string, any>) => void;
 	agentEnd?: Record<string, any>;
 	agentStarted?: boolean;
+	inflightInputs?: number;
+	deferredSettlement?: boolean;
+	settlementProbeTimer?: ReturnType<typeof setTimeout>;
 }
 const pendingCompletions: PendingCompletion[] = [];
 let rpcTurnActive = false;
@@ -334,9 +339,36 @@ let activeChatTurn: {
 function clearCompletionTimer(completion: PendingCompletion): void {
 	if (completion.timer) clearInterval(completion.timer);
 	completion.timer = null;
+	clearTimeout(completion.settlementProbeTimer);
+	completion.settlementProbeTimer = undefined;
+}
+
+async function settleDeferredRpcTurn(completion: PendingCompletion): Promise<void> {
+	if (pendingCompletions[0] !== completion || completion.inflightInputs || !completion.deferredSettlement) return;
+	try {
+		const state = await sendRpc("get_state") as { success?: boolean; data?: { isStreaming?: boolean; isCompacting?: boolean } };
+		if (!state.success) throw new Error("Could not query follow-up state");
+		if (pendingCompletions[0] !== completion || completion.inflightInputs || !completion.deferredSettlement) return;
+		if (state.data?.isStreaming === false && state.data.isCompacting === false) settleRpcTurn(completion.agentEnd ?? { messages: [] });
+	} catch (error) {
+		// Submission already succeeded. A failed idle probe must not say input was rejected.
+		logger.warn("[gateway] Could not settle acknowledged follow-up; will retry state probe:", error);
+		if (pendingCompletions[0] === completion && !completion.settlementProbeTimer) {
+			completion.settlementProbeTimer = setTimeout(() => {
+				completion.settlementProbeTimer = undefined;
+				void settleDeferredRpcTurn(completion);
+			}, 1000);
+		}
+	}
 }
 
 function settleRpcTurn(event: Record<string, any>): void {
+	const pending = pendingCompletions[0];
+	if (pending?.inflightInputs) {
+		pending.agentEnd = event;
+		pending.deferredSettlement = true;
+		return;
+	}
 	rpcTurnActive = false;
 	const active = getActiveChannel();
 	const completion = pendingCompletions.shift();
@@ -502,6 +534,7 @@ function createRpcProcess(): any {
 		cwd: process.cwd(),
 		env: {
 			...process.env,
+			PI_GATEWAY_RPC_CHILD: "1",
 			OLLAMA_HOST: process.env.OLLAMA_HOST || "localhost:11434",
 		},
 	});
@@ -527,7 +560,10 @@ function createRpcProcess(): any {
 			pendingCompletions[0]?.onEvent?.(msg);
 			if (msg.type === "agent_start") {
 				rpcTurnActive = true;
-				if (pendingCompletions[0]) pendingCompletions[0].agentStarted = true;
+				if (pendingCompletions[0]) {
+					pendingCompletions[0].agentStarted = true;
+					pendingCompletions[0].deferredSettlement = false;
+				}
 			}
 
 			if (msg.id) {
@@ -656,7 +692,10 @@ async function sendRpc(
 	const payload = { id, type: command, ...data };
 
 	return new Promise((resolve, reject) => {
-		const timer = setTimeout(() => {
+		// Pi emits these ACKs after extension preflight. Human dialogs have their own
+		// timeout; a fixed 30s ACK deadline must not cancel a still-valid question.
+		const waitsForPreflight = ["prompt", "switch_session", "set_model"].includes(command);
+		const timer = waitsForPreflight ? undefined : setTimeout(() => {
 			const idx = pendingRequests.findIndex((r) => r.id === id);
 			if (idx !== -1) {
 				pendingRequests.splice(idx, 1);
@@ -686,12 +725,22 @@ function isAgentBusy(): boolean {
 }
 
 async function sendSteerRpc(message: string): Promise<void> {
-	const ackResponse = await sendRpc("steer", { message });
-	const ack = ackResponse as Record<string, unknown>;
-	if (!ack.success) {
-		throw new Error(`Steer rejected: ${JSON.stringify(ackResponse)}`);
+	const completion = pendingCompletions[0];
+	if (!completion) throw new Error("The model turn already ended");
+	completion.inflightInputs = (completion.inflightInputs ?? 0) + 1;
+	try {
+		// Pi decides atomically: steer while streaming, start a prompt if it already ended.
+		// A bare steer after agent_settled would leave the input stranded in Pi's queue.
+		const ackResponse = await sendRpc("prompt", { message, streamingBehavior: "steer" });
+		const ack = ackResponse as Record<string, unknown>;
+		if (!ack.success) throw new Error(`Follow-up rejected: ${JSON.stringify(ackResponse)}`);
+		logger.info("[gateway] Follow-up ACK received");
+	} finally {
+		completion.inflightInputs = (completion.inflightInputs ?? 1) - 1;
+		// A handled input can emit no agent events; a newly started model can settle
+		// before its ACK arrives. Probe only after all preflights acknowledged.
+		await settleDeferredRpcTurn(completion);
 	}
-	logger.info("[gateway] Steer ACK received");
 }
 
 async function sendPromptRpc(
@@ -821,7 +870,7 @@ const adapterCallbacks: AdapterCallbacks = {
 			if (turn?.kind === "prompt" && !turn.stopping && ownsChatTurn(turn.message, message) && !sessionCmd.startsWith("/") && !sessionCmd.startsWith("Callback:")) {
 				let notice: string;
 				try {
-					if (isAgentBusy()) {
+					if (isAgentBusy() && pendingCompletions[0]?.agentStarted) {
 						await sendSteerRpc(message.content);
 						notice = "↪️ 已收到补充要求，本轮会按这个调整。";
 					} else if (turn.phase === "preparing") {
@@ -829,7 +878,9 @@ const adapterCallbacks: AdapterCallbacks = {
 						notice = "↪️ 已收到补充要求，本轮会按这个调整。";
 					} else {
 						turn.deferred.push(message);
-						notice = "↪️ 本轮模型已结束，补充已排队；回复发送完成后会启动下一轮。";
+						notice = isAgentBusy()
+							? "↪️ 当前正在处理扩展输入，补充已排队；本轮结束后会启动下一轮。"
+							: "↪️ 本轮模型已结束，补充已排队；回复发送完成后会启动下一轮。";
 					}
 				} catch (error) {
 					await adapterForCommand?.sendMessage(message.channelId, "❌ 补充要求未提交，请等当前任务结束后重试。");
@@ -846,7 +897,11 @@ const adapterCallbacks: AdapterCallbacks = {
 			stopping: false, queued: [] as string[], reply: undefined as ChatReply | undefined,
 			phase: "preparing" as "preparing" | "running" | "delivering", deferred: [] as PlatformMessage[],
 		};
-		if (reservedTurn) activeChatTurn = reservedTurn;
+		if (reservedTurn) {
+			activeChatTurn = reservedTurn;
+			// Session/model hooks may ask questions before the model turn starts.
+			setActiveChannel({ platform: message.platform, channelId: message.channelId, userId: message.userId });
+		}
 		try {
 			const resumeCallbackIndex = parseResumeCallback(sessionCmd);
 			const sessionCommand = parseChatSessionCommand(sessionCmd);
@@ -1365,12 +1420,11 @@ const adapterCallbacks: AdapterCallbacks = {
 			turn.reply = reply;
 			try {
 				await reply?.start();
+				setFlushHandler(() => reply?.waitForAnswer());
+				setStreamRedirectHandler(() => reply?.resume());
 				if (turn.stopping) { await reply?.finish("", "stopped"); return; }
 				if (!boundSession) await switchRpcSession(ensureGatewaySessionFile(session));
 				if (turn.stopping) { await reply?.finish("", "stopped"); return; }
-				setActiveChannel({ platform: message.platform, channelId: message.channelId, userId: message.userId });
-				setFlushHandler(() => reply?.waitForAnswer());
-				setStreamRedirectHandler(() => reply?.resume());
 				const guard = buildPolicyGuard(message.platform, message.userId);
 				const prompt = [message.content, ...turn.queued].join("\n\n");
 				turn.queued = [];
@@ -1388,14 +1442,13 @@ const adapterCallbacks: AdapterCallbacks = {
 				const detail = error instanceof Error ? error.message : String(error);
 				try { await reply?.finish(turn.stopping ? "" : detail, turn.stopping ? "stopped" : "error"); }
 				catch (deliveryError) { logger.error("[gateway] Failed to deliver turn error:", deliveryError); }
-			} finally {
+			}
+		} finally {
+			if (reservedTurn && activeChatTurn === reservedTurn) {
 				cleanupPendingUiRequests();
 				setFlushHandler(null);
 				setStreamRedirectHandler(null);
 				setActiveChannel(null);
-			}
-		} finally {
-			if (reservedTurn && activeChatTurn === reservedTurn) {
 				activeChatTurn = null;
 				if (reservedTurn.deferred.length) {
 					if (reservedTurn.stopping) {
@@ -1428,6 +1481,7 @@ async function initializeAdapters(): Promise<void> {
 				botToken: config.platforms.discord.botToken,
 				guildId: config.platforms.discord.guildId,
 				allowedChannels: config.platforms.discord.allowedChannels,
+				allowedRoles: config.platforms.discord.allowedRoles,
 				requireMention: config.platforms.discord.requireMention,
 				reactions: config.platforms.discord.reactions,
 			});
@@ -1782,6 +1836,7 @@ async function getDetachedGatewayHealth(pid: number) {
 }
 
 export default function (pi: ExtensionAPI) {
+	if (isGatewayRpcChild()) return;
 	config = loadConfig();
 	lastDetachedHealthConfig = config;
 	state = {

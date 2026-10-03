@@ -1,7 +1,9 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { installDeferred } from "./lazy-extension.js";
+import { isGatewayRpcChild } from "./rpc-child.js";
 
 export default function (pi: ExtensionAPI) {
+	if (isGatewayRpcChild()) return;
 	installDeferred(pi, () => import("./index.js"), {
 		commands: [
 			{

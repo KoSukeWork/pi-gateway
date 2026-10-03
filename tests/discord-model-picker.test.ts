@@ -119,4 +119,24 @@ await (adapter as any).handleModelPickerInteraction(
 assert.equal(getDiscordModelPickerState("channel", "first")?.view.provider, "OpenAI");
 assert.equal(getDiscordModelPickerState("channel", "second")?.view.provider, "Other");
 
+// Two clicks while the first acknowledgement is in flight execute one switch.
+// The stale click must be private so it cannot overwrite the switching/result message.
+rememberDiscordModelPicker("channel", "double", "owner", catalog);
+let release!: () => void;
+const gate = new Promise<void>((done) => { release = done; });
+const ack = (adapter as any).ackInteraction;
+(adapter as any).ackInteraction = async (data: unknown, payload: any) => {
+	await ack(data, payload);
+	if (payload.type === 7) await gate;
+};
+const click = interaction({ messageId: "double", userId: "owner", customId: "modelsel", values: ["model:OpenAI/gpt-5"] });
+const first = (adapter as any).handleModelPickerInteraction(click);
+await (adapter as any).handleModelPickerInteraction(click);
+assert.equal(acknowledgements.at(-1)?.type, 4);
+assert.equal(acknowledgements.at(-1)?.data?.flags, 64);
+const before = callbacks.length;
+release(); await first;
+assert.equal(callbacks.length, before + 1);
+assert.equal(getDiscordModelPickerState("channel", "double"), null);
+
 console.log("discord model picker tests passed");

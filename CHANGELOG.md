@@ -7,6 +7,11 @@ All notable changes to this project will be documented in this file.
 - Preserve pinned npm/Git extension loading in gateway RPC children; include isolated CLI resolution regressions in the default suite.
 
 ### Changed
+- Restore Pi extension discovery, package filters and project trust in RPC workers while disabling nested gateway registration.
+- Forward configured Discord role restrictions at startup and retain extension errors in live/final replies.
+- Make model selections single-use and expire Stop ownership before final delivery, even when Discord cleanup fails.
+- Route session/model preflight dialogs to their requesting channel and honor dialog deadlines instead of a fixed 30-second ACK timeout.
+- Submit supplemental input atomically through Pi prompt/steer routing; retain turn ownership through pending input ACKs and deliver preflight supplements in the next turn.
 - Rebuild the chat reply lifecycle around one persistent reply, serialized/coalesced preview edits, task phases, elapsed time, and reliable final delivery. Dialogs resume the same reply instead of creating extra thinking placeholders.
 - Follow the Hermes Discord patterns of in-place streaming previews, final-only overflow delivery, and processing/completion reactions. Preserve fenced code and Unicode across final chunks, retain status in oversized previews, and report partial delivery to the user.
 - Complete deferred Discord slash responses and replace model/resume pickers with their outcome. Add `/help`, `/stop`, owner-bound Stop buttons, and native input/editor modals.

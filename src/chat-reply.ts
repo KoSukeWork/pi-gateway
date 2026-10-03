@@ -21,6 +21,7 @@ export class ChatReply {
 	private startedAt = Date.now();
 	private extensionStatuses = new Map<string, string>();
 	private extensionDisplayHistory = new Map<string, string>();
+	private extensionErrors: string[] = [];
 	private starting: Promise<void> | null = null;
 	private finishing: Promise<void> | null = null;
 	private lastFlushedText = "";
@@ -104,6 +105,8 @@ export class ChatReply {
 			this.phase = "🔄 正在重试…";
 		} else if (event.type === "auto_compaction_end" || event.type === "compaction_end" || event.type === "auto_retry_end" || event.type === "summarization_retry_finished") {
 			this.phase = "⏳ 正在思考…";
+		} else if (event.type === "extension_error") {
+			this.extensionErrors.push(String(event.error || "扩展执行失败，请检查网关日志。"));
 		} else if (event.type === "extension_ui_request" && event.method === "setStatus") {
 			const key = `status:${String(event.statusKey ?? "status")}`;
 			if (event.statusText) this.extensionStatuses.set(key, String(event.statusText));
@@ -129,7 +132,7 @@ export class ChatReply {
 		const seconds = Math.floor((Date.now() - this.startedAt) / 1000);
 		const elapsed = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, "0")}`;
 		const phase = this.waiting ? "🙋 等待你的回答" : this.phase;
-		const statuses = [...this.extensionStatuses.values()].slice(0, 3).map((value) => truncateDiscordContent(value.replace(/\n/g, " · "), 160)).join(" · ");
+		const statuses = [...(this.extensionErrors.length ? [`⚠️ 扩展执行出错：${this.extensionErrors.at(-1)}`] : []), ...this.extensionStatuses.values()].slice(0, 3).map((value) => truncateDiscordContent(value.replace(/\n/g, " · "), 160)).join(" · ");
 		const footer = `${phase} · ${elapsed}${statuses ? ` · ${statuses}` : ""} · /stop 可停止`;
 		const publicText = this.adapter.platform === "discord" ? truncateDiscordMarkdown(this.text, 2000 - footer.length - 6) : this.text;
 		return publicText ? `${publicText}\n\n${this.adapter.platform === "discord" ? "-# " : ""}${footer}` : footer;
@@ -190,6 +193,7 @@ export class ChatReply {
 				? `${this.text}${this.text ? "\n\n" : ""}❌ ${text}`
 				: text || this.text || "✅ 本轮已完成，没有文本回复。";
 		if (this.extensionDisplayHistory.size) body += "\n\n扩展显示信息：\n" + [...this.extensionDisplayHistory.entries()].map(([key, value]) => `${key}: ${value}`).join("\n\n");
+		if (this.extensionErrors.length) body += "\n\n⚠️ 扩展执行出错：\n" + this.extensionErrors.join("\n\n");
 		try {
 			const delivery = this.messageId
 				? await this.deliverFinal(body)

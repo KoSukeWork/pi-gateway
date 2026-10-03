@@ -547,10 +547,10 @@ export class DiscordAdapter extends BaseAdapter {
 
     const expired = async () => {
       await this.ackInteraction(data, {
-        type: 7,
+        type: 4,
         data: {
           content: "Model list expired. Run /model again.",
-          components: [],
+          flags: 64,
         },
       });
     };
@@ -594,6 +594,9 @@ export class DiscordAdapter extends BaseAdapter {
 
     if (customId === DISCORD_MODEL_SELECT_ID) {
       const key = resolveDiscordModelSelection(values[0] ?? "", state.models);
+      // Claim the selection before the REST await, as Hermes resolves its view before editing.
+      // A second click must not run another switch or overwrite the first click's result.
+      forgetDiscordModelPicker(channelId, messageId);
       await this.ackInteraction(data, {
         type: 7,
         data: {
@@ -602,7 +605,6 @@ export class DiscordAdapter extends BaseAdapter {
         },
       });
       if (key) {
-        forgetDiscordModelPicker(channelId, messageId);
         await this.emitCallback(data, `model:${key}`);
       }
       return true;
@@ -980,6 +982,10 @@ export class DiscordAdapter extends BaseAdapter {
   async editMessage(channelId: string, messageId: string, content: string, options?: MessageEditOptions): Promise<void | MessageDelivery> {
     const key = `${channelId}:${messageId}`;
     const preview = options?.finalize === false;
+    const hadActiveReply = this.activeReplies.has(key);
+    // Logical ownership expires even if editing/deleting the old controls fails.
+    // Otherwise a leftover Stop button can abort a later task by the same owner.
+    if (!preview) this.activeReplies.delete(key);
     let chunks = preview ? [truncateDiscordContent(content)] : splitDiscordContent(content);
     const totalChunks = chunks.length;
     let attachmentDelivered = false;
@@ -1002,7 +1008,7 @@ export class DiscordAdapter extends BaseAdapter {
       `/channels/${channelId}/messages/${messageId}`,
       {
         method: "PATCH",
-        body: JSON.stringify({ content: chunks[0], ...(!preview && this.activeReplies.has(key) ? { components: [] } : {}), allowed_mentions: { parse: [], replied_user: false } }),
+        body: JSON.stringify({ content: chunks[0], ...(!preview && hadActiveReply ? { components: [] } : {}), allowed_mentions: { parse: [], replied_user: false } }),
       },
       "edit message",
       );
