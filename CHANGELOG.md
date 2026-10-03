@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Preserve pinned npm/Git extension loading in gateway RPC children; include isolated CLI resolution regressions in the default suite.
+
 ### Changed
 - Rebuild the chat reply lifecycle around one persistent reply, serialized/coalesced preview edits, task phases, elapsed time, and reliable final delivery. Dialogs resume the same reply instead of creating extra thinking placeholders.
 - Follow the Hermes Discord patterns of in-place streaming previews, final-only overflow delivery, and processing/completion reactions. Preserve fenced code and Unicode across final chunks, retain status in oversized previews, and report partial delivery to the user.

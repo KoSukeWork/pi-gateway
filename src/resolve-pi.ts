@@ -67,13 +67,13 @@ function agentDir(): string {
 }
 
 function installedPackagePath(source: string): string | null {
-	const git = source.match(/^git:(?:https?:\/\/)?(.+?)(?:\.git)?$/i);
+	const git = source.match(/^git:(?:https?:\/\/)?([^@]+?)(?:\.git)?(?:@.+)?$/i);
 	if (git) {
 		const repo = git[1].replace(/^github\.com\//i, "github.com/");
 		const path = join(agentDir(), "git", ...repo.split("/").filter(Boolean));
 		return existsSync(path) ? path : null;
 	}
-	const npm = source.match(/^npm:(.+)$/i);
+	const npm = source.match(/^npm:((?:@[^/@]+\/)?[^/@]+)(?:@.+)?$/i);
 	if (npm) {
 		const path = join(agentDir(), "npm", "node_modules", npm[1]);
 		return existsSync(path) ? path : null;
